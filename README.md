@@ -189,7 +189,7 @@ src/distill_tools.py     Async worker loop: fleet health, semaphores, checkpoint
 src/mock_tools.py        Shared deterministic tool executor (get_user, send_email, db_query, weather, file_exists)
 src/archive_data.py      Archive data/raw to data/archive/<timestamp>_<label>/ - never deletes
 safe_launch.sh           Archive-first launcher with raised fd limit
-configs/roster.yaml      Teacher fleet config (provider endpoints, models, concurrency, weights)
+configs/roster.example.yaml  Teacher fleet config template (copy to roster.yaml: endpoints, models, weights)
 ```
 
 ## License
