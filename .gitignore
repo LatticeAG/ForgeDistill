@@ -40,3 +40,8 @@ build/
 
 # internal loop checklist
 *PROD-READINESS*.md
+*.log
+VERIFY-STATE.txt
+PROD-LOOP-DONE.md
+prod_loop.sh
+loop_watcher.sh
