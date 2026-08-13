@@ -1,0 +1,37 @@
+# ---- credentials & secrets ----
+.env
+.env.*
+*.key
+*.pem
+
+# ---- data (never commit generated traces) ----
+data/
+*.jsonl
+
+# ---- internal planning docs (LatticeAG convention: never public) ----
+*HANDOFF*.md
+*SPEC*.md
+*ROADMAP*.md
+*prompt*.md
+*REVIEW*.md
+*WHAT-NEXT*.md
+
+# ---- local config with real providers/keys ----
+configs/roster.yaml
+
+# ---- python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# ---- tooling ----
+.idea/
+.vscode/
+.DS_Store
+*.swp
