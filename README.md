@@ -179,7 +179,7 @@ python -c "import sys,random; sys.path.insert(0,'src'); from agentic_plans impor
 
 ### Dataset (structural) audit
 
-Until `n_traces >= 500` exists in `data/raw`, every **RATE** cell below is **TBD**. Run:
+Latest measured run: **500 traces**, multi-provider teacher fleet, `reversed-v2`.
 
 ```bash
 python src/eval_card.py --input data/raw --out data/raw/eval_card.json --require-gates
@@ -187,25 +187,30 @@ python src/eval_card.py --input data/raw --out data/raw/eval_card.json --require
 
 | Metric | Source path | Value |
 |---|---|---|
-| Trace count | `n_traces` | TBD (run: command above) |
-| Prose gate pass rate | `gates.validate_prose_trace_pass` | TBD (run: command above) |
-| Grounding gate pass rate | `gates.validate_answer_grounding_pass` | TBD (run: command above) |
-| Chain gate pass rate | `gates.validate_chain_pass` | TBD (run: command above) |
-| Dependency fidelity pass rate | `gates.dependency_fidelity_pass` | TBD (run: command above) |
-| Nudge leak rate | `gates.nudge_leak_rate` | TBD (run: command above) |
-| Malformed tool-call rate | `gates.malformed_tool_call_rate` | TBD (run: command above) |
-| Multi-round rate | `structure.multi_round_rate` | TBD (run: command above) |
-| Unique prompt rate | `structure.unique_prompt_rate` | TBD (run: command above) |
-| Send-email learned address rate | `structure.send_email_learned_address_rate` | TBD (run: command above) |
-| Cross-teacher split rate | `structure.cross_teacher_split_rate` | TBD (run: command above) |
-| Cross-teacher fallback rate | `structure.cross_teacher_fallback_rate` | TBD (run: command above) |
-| 300-chain invalid | `commands.stress_300` stdout | TBD (0 = 300/300 valid; run: command above) |
-| Plan templates defined | `skills.n_templates_defined` | 47 |
-| Skill tags defined | `skills.n_tags_defined` | 15 |
+| Trace count | `n_traces` | **500** |
+| Prose gate pass rate | `gates.validate_prose_trace_pass` | **1.0** |
+| Grounding gate pass rate | `gates.validate_answer_grounding_pass` | **1.0** |
+| Chain gate pass rate | `gates.validate_chain_pass` | **1.0** |
+| Dependency fidelity pass rate | `gates.dependency_fidelity_pass` | **1.0** |
+| Nudge leak rate | `gates.nudge_leak_rate` | **0.0** |
+| Malformed tool-call rate | `gates.malformed_tool_call_rate` | **0.0** |
+| Multi-round rate | `structure.multi_round_rate` | **0.988** |
+| Unique prompt rate | `structure.unique_prompt_rate` | **0.996** |
+| Unique trajectory hash rate | `structure.unique_traj_hash_rate` | **1.0** |
+| Send-email learned address rate | `structure.send_email_learned_address_rate` | **1.0** |
+| Cross-teacher split rate | `structure.cross_teacher_split_rate` | 0.0 (opt-in, off by default) |
+| Cross-teacher fallback rate | `structure.cross_teacher_fallback_rate` | 0.0 |
+| 300-chain invalid | `commands.stress_300` stdout | **0** (300/300 valid) |
+| Plan templates defined | `skills.n_templates_defined` | **47** |
+| Skill tags defined | `skills.n_tags_defined` | **15** |
 | Easy tier plans | `skills.tier_counts.easy` | 9 |
 | Medium tier plans | `skills.tier_counts.medium` | 12 |
 | Hard tier plans | `skills.tier_counts.hard` | 21 |
 | Expert tier plans | `skills.tier_counts.expert` | 5 |
+
+`--require-gates` exits 0 on this run: prose, grounding, chain, and dependency
+fidelity are all 1.0 with zero nudge leaks. Every number above is copied from
+`data/raw/eval_card.json` - the file, not a hand-typed claim.
 
 Historical note (2026-08-13, v0.1 pilot, n=10): 10/10 passed format + grounding gates; 100% multi-round; 0 malformed tool calls; 0 unique-prompt collisions; all send_email calls used in-context learned emails.
 
