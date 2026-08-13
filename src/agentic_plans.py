@@ -51,31 +51,87 @@ assert "" not in BAD_CITIES
 # Ref resolution
 # ----------------------------------------------------------------------
 _REF_RE = re.compile(r"^\$(\d+)\.result(?:\.rows\[(\d+)\])?(?:\.([A-Za-z_][A-Za-z0-9_]*))?$")
-_REF_RE_SUB = re.compile(r"\$(\d+)\.result(?:\.rows\[(\d+)\])?(?:\.([A-Za-z_][A-Za-z0-9_]*))?")
+_NESTED_REF_RE = re.compile(r"^\$(\d+)\.result(\.[A-Za-z0-9_\[\]\.\|]+)$")
+# Inline: segment-based so a trailing sentence period is not swallowed.
+_REF_RE_SUB = re.compile(
+    r"\$(\d+)\.result((?:\.[A-Za-z_][A-Za-z0-9_]*(?:\[\d+\])?(?:\|[A-Za-z_]+)?)*)"
+)
+_INDEX_RE = re.compile(r"^([A-Za-z0-9_]+)\[(\d+)\]$")
+NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
-def _resolve_ref(ref: str, steps: list[dict]) -> object:
-    """Resolve "$S.result[.rows[i]][.field]" against executed steps.
-
-    refs index into steps (including error steps), NOT into a success list.
-    """
-    m = _REF_RE.match(ref)
-    if not m:
-        raise ValueError(f"bad ref: {ref}")
-    si, row, field = int(m.group(1)), m.group(2), m.group(3)
+def _payload_result(steps: list[dict], si: int) -> object:
     if si >= len(steps):
         raise ValueError(f"ref step {si} out of range (only {len(steps)} steps)")
     payload = steps[si]["result"]
     if payload.get("status") != 200:
         raise ValueError(f"ref step {si} is an error step - cannot dereference result")
-    result = payload["result"]
-    if row is not None:
-        result = result["rows"][int(row)]
-    if field:
-        if field not in result:
-            raise ValueError(f"ref field '{field}' not in step {si} result: {result}")
-        return result[field]
-    return result
+    return payload["result"]
+
+
+def _resolve_path(result_obj, path: str) -> object:
+    """Walk a dotted path on a result object.
+
+    Splits on `.`, treats name[N] as a list index, walks dict keys.
+    Suffix |first_number: first NUMBER_RE match in the stringified value.
+    """
+    raw = path[1:] if path.startswith(".") else path
+    cur = result_obj
+    if not raw:
+        return cur
+    for part in raw.split("."):
+        if not part:
+            raise ValueError(f"empty path segment in {path!r}")
+        suffix = None
+        if "|" in part:
+            part, suffix = part.split("|", 1)
+        m = _INDEX_RE.match(part)
+        if m:
+            key, idx = m.group(1), int(m.group(2))
+            if not isinstance(cur, dict) or key not in cur:
+                raise ValueError(f"path key '{key}' not in step result: {cur}")
+            seq = cur[key]
+            if not isinstance(seq, list):
+                raise ValueError(f"path '{key}' is not a list")
+            cur = seq[idx]
+        else:
+            if not isinstance(cur, dict) or part not in cur:
+                raise ValueError(f"path key '{part}' not in step result: {cur}")
+            cur = cur[part]
+        if suffix == "first_number":
+            mnum = NUMBER_RE.search(str(cur))
+            if not mnum:
+                raise ValueError(f"no number in {cur!r}")
+            tok = mnum.group(0)
+            cur = float(tok) if "." in tok else int(tok)
+        elif suffix:
+            raise ValueError(f"unknown path suffix '{suffix}'")
+    return cur
+
+
+def _resolve_ref(ref: str, steps: list[dict]) -> object:
+    """Resolve "$S.result[.path]" against executed steps.
+
+    Fast path: existing one-field / rows[i] regex.
+    Else: nested walker for hits[N], account.owner.email, body|first_number, ...
+    refs index into steps (including error steps), NOT into a success list.
+    """
+    m = _REF_RE.match(ref)
+    if m:
+        si, row, field = int(m.group(1)), m.group(2), m.group(3)
+        result = _payload_result(steps, si)
+        if row is not None:
+            result = result["rows"][int(row)]
+        if field:
+            if field not in result:
+                raise ValueError(f"ref field '{field}' not in step {si} result: {result}")
+            return result[field]
+        return result
+    m = _NESTED_REF_RE.match(ref)
+    if not m:
+        raise ValueError(f"bad ref: {ref}")
+    result = _payload_result(steps, int(m.group(1)))
+    return _resolve_path(result, m.group(2))
 
 
 def _fill_args(args_tpl: dict, steps: list[dict], vars_: dict) -> dict:
@@ -83,16 +139,13 @@ def _fill_args(args_tpl: dict, steps: list[dict], vars_: dict) -> dict:
     (both as whole values and inline inside strings)."""
     out = {}
     for k, v in args_tpl.items():
-        if isinstance(v, str) and v.startswith("$") and _REF_RE.match(v):
+        if isinstance(v, str) and v.startswith("$") and (
+            _REF_RE.match(v) or _NESTED_REF_RE.match(v)
+        ):
             out[k] = _resolve_ref(v, steps)
         elif isinstance(v, str):
             def _sub(m):
-                ref = f"${m.group(1)}.result"
-                if m.group(2) is not None:
-                    ref += f".rows[{m.group(2)}]"
-                if m.group(3) is not None:
-                    ref += f".{m.group(3)}"
-                return str(_resolve_ref(ref, steps))
+                return str(_resolve_ref(m.group(0), steps))
             resolved = _REF_RE_SUB.sub(_sub, v)
             # Bare placeholder like "{uid}" keeps the ORIGINAL type (int stays int)
             m = re.fullmatch(r"\{([a-z_0-9]+)\}", resolved)
@@ -118,6 +171,7 @@ PLANS = [
     {
         "id": "user-email-welcome",
         "skills": ["multi_hop", "stop"],
+        "tier": "easy",
         "prompt": "Look up user {uid} and send them a welcome email using their registered address.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -128,6 +182,7 @@ PLANS = [
     {
         "id": "user-email-notify",
         "skills": ["multi_hop", "stop"],
+        "tier": "easy",
         "prompt": "Fetch user {uid}'s profile, then send a notification to their email address about '{subject}'.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -138,6 +193,7 @@ PLANS = [
     {
         "id": "user-email-get-address",
         "skills": ["multi_hop", "stop"],
+        "tier": "easy",
         "prompt": "Get the email address of user {uid}, then send them '{subject}'.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -147,6 +203,7 @@ PLANS = [
     {
         "id": "user-email-account",
         "skills": ["multi_hop", "stop"],
+        "tier": "easy",
         "prompt": "Retrieve user {uid} and email their account about '{subject}'.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -158,6 +215,7 @@ PLANS = [
     {
         "id": "user-plan-count",
         "skills": ["multi_hop"],
+        "tier": "easy",
         "prompt": "Get user {uid}'s plan from their profile, then count users on that same plan.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -167,6 +225,7 @@ PLANS = [
     {
         "id": "user-plan-list",
         "skills": ["multi_hop"],
+        "tier": "easy",
         "prompt": "Fetch user {uid}, read their plan, then query the database for other users on that plan.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -177,6 +236,7 @@ PLANS = [
     {
         "id": "weather-then-user-email",
         "skills": ["multi_hop", "reorder"],
+        "tier": "medium",
         "prompt": "Check the weather in {city}, then email the details to user {uid}.",
         "plan": [
             {"tool": "weather.get", "args": {"city": "{city}"}},
@@ -188,6 +248,7 @@ PLANS = [
     {
         "id": "weather-report-email",
         "skills": ["multi_hop", "reorder"],
+        "tier": "medium",
         "prompt": "Get weather for {city}, then send a weather report to user {uid}'s address.",
         "plan": [
             {"tool": "weather.get", "args": {"city": "{city}"}},
@@ -200,6 +261,7 @@ PLANS = [
     {
         "id": "db-count-email",
         "skills": ["multi_hop"],
+        "tier": "medium",
         "prompt": "Query the database for order count, then send user {uid} the number.",
         "plan": [
             {"tool": "db_query", "args": {"sql": "SELECT count(*) FROM orders"}},
@@ -212,6 +274,7 @@ PLANS = [
     {
         "id": "file-status-email",
         "skills": ["multi_hop"],
+        "tier": "medium",
         "prompt": "Verify {file} is present, then notify user {uid} about its status.",
         "plan": [
             {"tool": "file_exists", "args": {"filepath": "{file}"}},
@@ -223,6 +286,7 @@ PLANS = [
     {
         "id": "user-file-status",
         "skills": ["multi_hop", "digest"],
+        "tier": "medium",
         "prompt": "Look up user {uid}, check if {file} exists, then email them a full status report.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -235,6 +299,7 @@ PLANS = [
     {
         "id": "bad-id-stop",
         "skills": ["branch"],
+        "tier": "hard",
         "prompt": "Fetch user {bad_id} and, only if that lookup succeeds, email them about '{subject}'. Also check whether {file} exists. If the user is not found, do not email anyone else and do not try a different id.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{bad_id}"}, "expect": "error"},
@@ -244,6 +309,7 @@ PLANS = [
     {
         "id": "bad-id-stop-v2",
         "skills": ["branch"],
+        "tier": "hard",
         "prompt": "Look up user {bad_id}; email them '{subject}' only if that exact id exists. Separately check {file}. Do not substitute a different user id.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{bad_id}"}, "expect": "error"},
@@ -253,6 +319,7 @@ PLANS = [
     {
         "id": "bad-city-only-if",
         "skills": ["branch"],
+        "tier": "hard",
         "prompt": "Look up user {uid}, then get weather in {bad_city}. Email them the weather only if the weather lookup works. If there is no weather data, do not email and do not try a different city.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -263,6 +330,7 @@ PLANS = [
     {
         "id": "two-user-notify",
         "skills": ["fanout", "multi_hop"],
+        "tier": "hard",
         "prompt": "Look up user {uid} and user {uid2}, then send each a notification.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -274,6 +342,7 @@ PLANS = [
     {
         "id": "two-user-subject",
         "skills": ["fanout", "multi_hop"],
+        "tier": "hard",
         "prompt": "Fetch users {uid} and {uid2}, then email both about '{subject}'.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -289,6 +358,7 @@ PLANS = [
     {
         "id": "join-two-users-plan-email",
         "skills": ["join", "multi_hop"],
+        "tier": "hard",
         "prompt": "Look up user {uid} and user {uid2}. Query how many users share {uid}'s plan, then email {uid} a comparison of both users' plans and that count. Send only one email.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -304,6 +374,7 @@ PLANS = [
     {
         "id": "file-missing-no-email",
         "skills": ["branch"],
+        "tier": "hard",
         "prompt": "Look up user {uid}. If {missing_file} exists, email them about it. If it does not exist, do not send any email.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -313,6 +384,7 @@ PLANS = [
     {
         "id": "get-user-str-retry-int",
         "skills": ["recovery"],
+        "tier": "hard",
         "prompt": "Fetch user {uid} (the id may arrive as a string) and email them '{subject}' at their registered address.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid_str}"}, "expect": "error"},
@@ -323,6 +395,7 @@ PLANS = [
     {
         "id": "fanout-partial-fail",
         "skills": ["fanout", "branch"],
+        "tier": "hard",
         "prompt": "Look up users {uid} and {uid2}. Email {uid} about '{subject}'. Also attempt to email {uid2} but the second send will have a blank subject and should fail. Report the mixed outcome; do not hide the failure.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -334,6 +407,7 @@ PLANS = [
     {
         "id": "plan-filter-email-count",
         "skills": ["multi_hop"],
+        "tier": "medium",
         "prompt": "Get user {uid}'s plan, count how many users are on that plan, then email {uid} the count.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -348,6 +422,7 @@ PLANS = [
     {
         "id": "user-then-weather-email",
         "skills": ["reorder", "multi_hop"],
+        "tier": "medium",
         "prompt": "Look up user {uid} first, then check the weather in {city}, then email them the forecast. Do the user lookup before the weather call.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -362,6 +437,7 @@ PLANS = [
     {
         "id": "idempotent-reuse-email",
         "skills": ["idempotent", "recovery", "schema"],
+        "tier": "hard",
         "prompt": "Look up user {uid} once, then email them '{subject}'. If the first send is rejected, retry the send using the email you already learned — do not look the user up again.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -372,6 +448,7 @@ PLANS = [
     {
         "id": "empty-subject-retry",
         "skills": ["schema", "recovery"],
+        "tier": "hard",
         "prompt": "Look up user {uid} and email them. If send_email rejects an empty subject, retry with subject '{subject}'.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -382,6 +459,7 @@ PLANS = [
     {
         "id": "weather-db-join-email",
         "skills": ["join", "multi_hop"],
+        "tier": "hard",
         "prompt": "Get the weather in {city} and the order count from the database, then email user {uid} both facts in a single message.",
         "plan": [
             {"tool": "weather.get", "args": {"city": "{city}"}},
@@ -397,6 +475,7 @@ PLANS = [
     {
         "id": "guess-email-then-correct",
         "skills": ["recovery"],
+        "tier": "hard",
         "prompt": "Email user {uid} about '{subject}'. If you guess their address it will fail — look them up and send to the registered address.",
         "plan": [
             {"tool": "send_email", "args": {"to": "{guessed_email}", "subject": "{subject}", "body": "Hello."}, "expect": "error"},
@@ -407,6 +486,7 @@ PLANS = [
     {
         "id": "five-step-digest",
         "skills": ["digest", "multi_hop"],
+        "tier": "expert",
         "prompt": "Build a digest for user {uid}: look them up, check whether {file} exists, get weather in {city}, count users on their plan, then email them one summary. Do not add extra calls after the email.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -423,6 +503,7 @@ PLANS = [
     {
         "id": "two-candidate-id",
         "skills": ["disambiguate", "recovery"],
+        "tier": "expert",
         "prompt": "The user id might be {bad_id} or {fix_id}. Try {bad_id} first; if that returns 404, try {fix_id}, then email them '{subject}'.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{bad_id}"}, "expect": "error"},
@@ -433,11 +514,278 @@ PLANS = [
     {
         "id": "stop-after-welcome",
         "skills": ["stop", "multi_hop"],
+        "tier": "easy",
         "prompt": "Look up user {uid} and send a single welcome email to their registered address. Stop after that send succeeds — do not make extra tool calls.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
             {"tool": "send_email", "args": {"to": "$0.result.email", "subject": "Welcome to the platform",
                                             "body": "Hi $0.result.name, welcome aboard."}},
+        ],
+    },
+    # ==================================================================
+    # v0.2 tools: search / calendar / calc / crm (nested)
+    # ==================================================================
+    {
+        "id": "search-get-email",
+        "skills": ["search", "multi_hop"],
+        "tier": "medium",
+        "prompt": "Search for '{q}', open the first hit, look up user {uid}, and email them the snippet.",
+        "plan": [
+            {"tool": "search.query", "args": {"q": "{q}"}},
+            {"tool": "search.get", "args": {"doc_id": "$0.result.hits[0].doc_id"}},
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "send_email", "args": {
+                "to": "$2.result.email",
+                "subject": "Search result",
+                "body": "Hit: $0.result.hits[0].snippet",
+            }},
+        ],
+    },
+    {
+        "id": "search-miss-stop",
+        "skills": ["search", "branch"],
+        "tier": "hard",
+        "prompt": "Search for '{bad_q}'. If there are no hits, stop. Do not fetch a document and do not send email.",
+        "plan": [
+            {"tool": "search.query", "args": {"q": "{bad_q}"}},
+        ],
+    },
+    {
+        "id": "search-then-calc-email",
+        "skills": ["search", "arithmetic", "multi_hop"],
+        "tier": "hard",
+        "prompt": "Search for '{q}', open the first document, multiply the published figure by {price}, then email user {uid} the result.",
+        "plan": [
+            {"tool": "search.query", "args": {"q": "{q}"}},
+            {"tool": "search.get", "args": {"doc_id": "$0.result.hits[0].doc_id"}},
+            {"tool": "calc.eval", "args": {"expr": "$1.result.body|first_number * {price}"}},
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "send_email", "args": {
+                "to": "$3.result.email",
+                "subject": "Computed figure",
+                "body": "Value: $2.result.value",
+            }},
+        ],
+    },
+    {
+        "id": "search-reorder-user-first",
+        "skills": ["search", "reorder"],
+        "tier": "medium",
+        "prompt": "Look up user {uid} first, then search for '{q}', then email them the first hit title. Do the user lookup before the search.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "search.query", "args": {"q": "{q}"}},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.email",
+                "subject": "Search hit",
+                "body": "First hit: $1.result.hits[0].title",
+            }},
+        ],
+    },
+    {
+        "id": "cal-list-email",
+        "skills": ["calendar", "multi_hop"],
+        "tier": "medium",
+        "prompt": "Look up user {uid}, list their calendar events, and email them the first event id.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "calendar.list", "args": {"user_id": "{uid}"}},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.email",
+                "subject": "Upcoming event",
+                "body": "First event: $1.result.events[0].event_id",
+            }},
+        ],
+    },
+    {
+        "id": "cal-create-learned",
+        "skills": ["calendar", "multi_hop"],
+        "tier": "medium",
+        "prompt": "Look up user {uid} and create a calendar event '{title}' at {start} inviting their registered address.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "calendar.create", "args": {
+                "title": "{title}",
+                "start": "{start}",
+                "attendee_email": "$0.result.email",
+            }},
+        ],
+    },
+    {
+        "id": "cal-create-guess-then-correct",
+        "skills": ["calendar", "recovery"],
+        "tier": "hard",
+        "prompt": "Create a calendar event '{title}' at {start} for user {uid}. If you guess their address it will fail - look them up and create with the registered address.",
+        "plan": [
+            {"tool": "calendar.create", "args": {
+                "title": "{title}", "start": "{start}", "attendee_email": "{guessed_email}",
+            }, "expect": "error"},
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "calendar.create", "args": {
+                "title": "{title}", "start": "{start}", "attendee_email": "$1.result.email",
+            }},
+        ],
+    },
+    {
+        "id": "cal-fanout-two",
+        "skills": ["calendar", "fanout"],
+        "tier": "hard",
+        "prompt": "Look up users {uid} and {uid2}, then create a '{title}' event at {start} for each registered address.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "get_user", "args": {"user_id": "{uid2}"}},
+            {"tool": "calendar.create", "args": {
+                "title": "{title}", "start": "{start}", "attendee_email": "$0.result.email",
+            }},
+            {"tool": "calendar.create", "args": {
+                "title": "{title}", "start": "{start}", "attendee_email": "$1.result.email",
+            }},
+        ],
+    },
+    {
+        "id": "cal-stop-after-create",
+        "skills": ["calendar", "stop"],
+        "tier": "easy",
+        "prompt": "Look up user {uid} and create one calendar event '{title}' at {start} for their registered address. Stop after the create succeeds - do not make extra tool calls.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "calendar.create", "args": {
+                "title": "{title}",
+                "start": "{start}",
+                "attendee_email": "$0.result.email",
+            }},
+        ],
+    },
+    {
+        "id": "calc-then-email",
+        "skills": ["arithmetic", "multi_hop"],
+        "tier": "easy",
+        "prompt": "Evaluate {expr}, look up user {uid}, and email them the computed value.",
+        "plan": [
+            {"tool": "calc.eval", "args": {"expr": "{expr}"}},
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "send_email", "args": {
+                "to": "$1.result.email",
+                "subject": "Calculation",
+                "body": "Result: $0.result.value",
+            }},
+        ],
+    },
+    {
+        "id": "calc-bad-expr-retry",
+        "skills": ["arithmetic", "recovery", "schema"],
+        "tier": "hard",
+        "prompt": "Evaluate {expr}. If the first expression is rejected as invalid, retry with {expr} and email user {uid} the value.",
+        "plan": [
+            {"tool": "calc.eval", "args": {"expr": "foo + 1"}, "expect": "error"},
+            {"tool": "calc.eval", "args": {"expr": "{expr}"}},
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "send_email", "args": {
+                "to": "$2.result.email",
+                "subject": "Calculation",
+                "body": "Result: $1.result.value",
+            }},
+        ],
+    },
+    {
+        "id": "crm-owner-email",
+        "skills": ["nested", "multi_hop"],
+        "tier": "medium",
+        "prompt": "Fetch CRM account {account_id} and email the account owner about '{subject}'.",
+        "plan": [
+            {"tool": "crm.get_account", "args": {"account_id": "{account_id}"}},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.account.owner.email",
+                "subject": "{subject}",
+                "body": "Hello $0.result.account.owner.name, regarding account $0.result.account.name.",
+            }},
+        ],
+    },
+    {
+        "id": "crm-seats-calc-email",
+        "skills": ["nested", "arithmetic", "join"],
+        "tier": "hard",
+        "prompt": "Fetch CRM account {account_id}, multiply seats by {price}, and email the owner the total.",
+        "plan": [
+            {"tool": "crm.get_account", "args": {"account_id": "{account_id}"}},
+            {"tool": "calc.eval", "args": {"expr": "$0.result.account.billing.seats * {price}"}},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.account.owner.email",
+                "subject": "Seat cost",
+                "body": "Seats total: $1.result.value",
+            }},
+        ],
+    },
+    {
+        "id": "crm-unknown-stop",
+        "skills": ["nested", "branch"],
+        "tier": "hard",
+        "prompt": "Fetch CRM account {bad_account_id} and email the owner. If the account is unknown, do not email anyone.",
+        "plan": [
+            {"tool": "crm.get_account", "args": {"account_id": "{bad_account_id}"}, "expect": "error"},
+        ],
+    },
+    {
+        "id": "nested-schema-retry",
+        "skills": ["nested", "schema", "recovery"],
+        "tier": "expert",
+        "prompt": "Fetch CRM account {account_id} and email the owner. If send_email rejects an empty subject, retry with subject '{subject}'.",
+        "plan": [
+            {"tool": "crm.get_account", "args": {"account_id": "{account_id}"}},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.account.owner.email",
+                "subject": "",
+                "body": "Hello $0.result.account.owner.name.",
+            }, "expect": "error"},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.account.owner.email",
+                "subject": "{subject}",
+                "body": "Hello $0.result.account.owner.name, this is the corrected send.",
+            }},
+        ],
+    },
+    {
+        "id": "search-disambiguate",
+        "skills": ["search", "disambiguate"],
+        "tier": "expert",
+        "prompt": "Search for '{bad_q}' first; if that returns no hits, search for '{good_q}' and open the first document from the second search.",
+        "plan": [
+            {"tool": "search.query", "args": {"q": "{bad_q}"}},
+            {"tool": "search.query", "args": {"q": "{good_q}"}},
+            {"tool": "search.get", "args": {"doc_id": "$1.result.hits[0].doc_id"}},
+        ],
+    },
+    {
+        "id": "digest-search-cal-crm",
+        "skills": ["digest", "search", "calendar", "nested"],
+        "tier": "expert",
+        "prompt": "Build a digest for user {uid}: look them up, search '{q}' and open the first hit, list their calendar, fetch CRM account {account_id}, then email them one summary of the opaque ids. Do not add extra calls after the email.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "search.query", "args": {"q": "{q}"}},
+            {"tool": "search.get", "args": {"doc_id": "$1.result.hits[0].doc_id"}},
+            {"tool": "calendar.list", "args": {"user_id": "{uid}"}},
+            {"tool": "crm.get_account", "args": {"account_id": "{account_id}"}},
+            {"tool": "send_email", "args": {
+                "to": "$0.result.email",
+                "subject": "Digest",
+                "body": "Doc $2.result.doc_id, event $3.result.events[0].event_id, account owner $4.result.account.owner.email.",
+            }},
+        ],
+    },
+    {
+        "id": "idempotent-cal-reuse-email",
+        "skills": ["calendar", "idempotent"],
+        "tier": "hard",
+        "prompt": "Look up user {uid} once, then create a calendar event '{title}' at {start} for them. If the first create is rejected, retry using the email you already learned - do not look the user up again.",
+        "plan": [
+            {"tool": "get_user", "args": {"user_id": "{uid}"}},
+            {"tool": "calendar.create", "args": {
+                "title": "", "start": "{start}", "attendee_email": "$0.result.email",
+            }, "expect": "error"},
+            {"tool": "calendar.create", "args": {
+                "title": "{title}", "start": "{start}", "attendee_email": "$0.result.email",
+            }},
         ],
     },
 ]
@@ -447,6 +795,15 @@ VAR_POOLS = {
     "good_city": GOOD_CITIES, "bad_city": BAD_CITIES, "city": GOOD_CITIES,
     "file": GOOD_FILES, "missing_file": MISSING_FILES, "subject": SUBJECTS,
     "guessed_email": GUESSED_EMAILS,
+    "price": [20, 35, 50],
+    "expr": ["12 + 5", "20 * 3", "100 - 7", "48 / 4"],
+    "account_id": [1001, 1002],
+    "bad_account_id": [0, -1, 9999, 8888],
+    "q": ["census", "quarterly census", "capacity", "handbook"],
+    "good_q": ["figure", "capacity brief", "ops"],
+    "bad_q": ["xyzzy", "missingterm"],
+    "title": ["Sprint planning", "Design review", "Quarterly sync", "Kickoff"],
+    "start": ["2026-08-14T09:00:00", "2026-08-15T10:00:00", "2026-08-16T14:30:00"],
 }
 
 CHAIN_COUNT = len(PLANS)
@@ -464,6 +821,18 @@ def _plans_by_skill() -> dict[str, list[int]]:
 
 _SKILL_BUCKETS = _plans_by_skill()
 SKILLS = list(_SKILL_BUCKETS.keys())
+
+
+def _plans_by_tier() -> dict[str, list[int]]:
+    buckets: dict[str, list[int]] = {}
+    for i, p in enumerate(PLANS):
+        t = p.get("tier")
+        if t:
+            buckets.setdefault(t, []).append(i)
+    return buckets
+
+
+_TIER_BUCKETS = _plans_by_tier()
 
 
 def _pick_vars(plan_tpl: dict, rng: random.Random) -> dict:
@@ -507,16 +876,39 @@ def trajectory_hash(traj: dict) -> str:
 
 
 def build_chain(rng: random.Random, skill: str | None = None,
-                plan_index: int | None = None) -> dict:
-    """Pick a plan stratified by skill, fill vars/refs, execute deterministically.
+                plan_index: int | None = None, *,
+                tier: str | None = None,
+                exclude_ids: set[str] | None = None) -> dict:
+    """Pick a plan, fill vars/refs, execute deterministically.
 
-    Returns prompt, steps, vars, plan_index, plan_id, skills.
+    If plan_index is set, use it. Else if tier is set, sample that tier minus
+    exclude_ids. Else v0.1 skill sampling honoring exclude_ids.
+    Resample up to 40 times then raise RuntimeError("plan space exhausted").
+    Returns prompt, steps, vars, plan_index, plan_id, skills, tier.
     """
-    buckets = _SKILL_BUCKETS
+    exclude_ids = exclude_ids or set()
     if plan_index is None:
-        if skill is None or skill not in buckets:
-            skill = rng.choice(list(buckets.keys()))
-        plan_index = rng.choice(buckets[skill])
+        chosen = None
+        for _ in range(40):
+            if tier is not None:
+                bucket = [
+                    i for i in _TIER_BUCKETS.get(tier, [])
+                    if PLANS[i]["id"] not in exclude_ids
+                ]
+            else:
+                sk = skill
+                if sk is None or sk not in _SKILL_BUCKETS:
+                    sk = rng.choice(list(_SKILL_BUCKETS.keys()))
+                bucket = [
+                    i for i in _SKILL_BUCKETS[sk]
+                    if PLANS[i]["id"] not in exclude_ids
+                ]
+            if bucket:
+                chosen = rng.choice(bucket)
+                break
+        if chosen is None:
+            raise RuntimeError("plan space exhausted")
+        plan_index = chosen
     plan_tpl = PLANS[plan_index]
     vars_ = _pick_vars(plan_tpl, rng)
 
@@ -542,6 +934,7 @@ def build_chain(rng: random.Random, skill: str | None = None,
         "plan_index": plan_index,
         "plan_id": plan_tpl["id"],
         "skills": list(plan_tpl.get("skills") or []),
+        "tier": plan_tpl.get("tier"),
     }
 
 
@@ -567,6 +960,8 @@ def validate_chain(steps: list[dict]) -> str | None:
                 return f"step {i}: expected error but got success"
             if s["tool"] == "send_email" and r["result"].get("to") not in EMAIL_BY_USER.values():
                 return f"step {i}: send_email to unregistered address"
+            if s["tool"] == "calendar.create" and r["result"].get("attendee_email") not in EMAIL_BY_USER.values():
+                return f"step {i}: calendar.create unregistered attendee"
             continue
         # error step
         if expect in ("error", "stop"):

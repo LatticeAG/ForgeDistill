@@ -1,0 +1,12 @@
+{
+  "name": "nanbeige-chatml-v1",
+  "source": "Must be diffed against the Nanbeige checkpoint tokenizer_config.json chat_template before any README claim of tokenizer verification.",
+  "bos": "",
+  "eos": "<|im_end|>",
+  "roles": {
+    "system":    {"prefix": "<|im_start|>system\n",    "suffix": "<|im_end|>\n", "loss": false},
+    "user":      {"prefix": "<|im_start|>user\n",      "suffix": "<|im_end|>\n", "loss": false},
+    "assistant": {"prefix": "<|im_start|>assistant\n", "suffix": "<|im_end|>\n", "loss": true},
+    "tool":      {"prefix": "<|im_start|>user\n<tool_response>\n", "suffix": "\n</tool_response><|im_end|>\n", "loss": false}
+  }
+}

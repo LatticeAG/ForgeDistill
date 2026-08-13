@@ -78,18 +78,20 @@ def build_prose_prompt(traj: dict) -> str:
     return "\n".join(lines)
 
 
-def parse_teacher_output(content: str, n_steps: int) -> dict | None:
-    """Parse teacher reply. Returns {"thoughts": [...n_steps], "final": str} or None.
-
-    Strict: require >= n_steps <thought> blocks (no padding). Extra thoughts
-    are truncated to n_steps. FINAL_ANSWER: marker is required.
-    """
+def parse_thoughts(content: str, n_steps: int) -> list[str] | None:
+    """Same <thought> rules as today. FINAL_ANSWER is optional and ignored."""
     if not content or n_steps < 1:
         return None
     thoughts = [t.strip() for t in THOUGHT_RE.findall(content) if t.strip()]
     if len(thoughts) < n_steps:
         return None
-    thoughts = thoughts[:n_steps]
+    return thoughts[:n_steps]
+
+
+def parse_final(content: str) -> str | None:
+    """Extract FINAL_ANSWER body, stripping leftover tags. None if missing/empty."""
+    if not content:
+        return None
     m = re.search(r"FINAL_ANSWER:\s*(.*)$", content, re.S | re.I)
     if not m:
         return None
@@ -98,7 +100,56 @@ def parse_teacher_output(content: str, n_steps: int) -> dict | None:
     final = re.sub(r"<thought>.*?</thought>", "", final, flags=re.S).strip()
     if not final:
         return None
+    return final
+
+
+def parse_teacher_output(content: str, n_steps: int) -> dict | None:
+    """Parse teacher reply. Returns {"thoughts": [...n_steps], "final": str} or None.
+
+    Wrapper around parse_thoughts + parse_final. Single-teacher path stays one blob.
+    """
+    thoughts = parse_thoughts(content, n_steps)
+    final = parse_final(content)
+    if not thoughts or not final:
+        return None
     return {"thoughts": thoughts, "final": final}
+
+
+def build_answer_prompt(traj: dict, thoughts: list[str]) -> str:
+    """Answer-teacher prompt: execution record plus thought blocks. FINAL_ANSWER only."""
+    n = len(traj["steps"])
+    lines = [
+        "You are generating the FINAL ANSWER for a tool-calling training trace.",
+        "Another teacher already wrote the internal thoughts. You see the user",
+        "request, the exact tool execution record, and those thoughts.",
+        "Write ONLY the final answer. Do not emit tool calls. Do not invent values.",
+        "",
+        "USER: " + traj["prompt"],
+        "",
+        "TOOL EXECUTION RECORD:",
+    ]
+    for i, s in enumerate(traj["steps"]):
+        payload = json.dumps(s["result"], ensure_ascii=False)
+        lines.append(f"  Step {i+1}: {s['tool']}({json.dumps(s['args'], ensure_ascii=False)})")
+        lines.append(f"    -> {payload}")
+    lines += ["", "THOUGHTS:"]
+    for i, t in enumerate(thoughts[:n]):
+        lines.append(f"<thought>{t}</thought>")
+    lines += [
+        "",
+        "Write the final answer to the user as plain text.",
+        "The final answer MUST use REAL values from the tool results above",
+        "(exact numbers, names, addresses, counts, conditions). Do not invent values.",
+        "If a call failed, say so; do not pretend a substitute succeeded.",
+        "",
+        "Format your reply EXACTLY as:",
+        "FINAL_ANSWER:",
+        "plain-text answer grounded in the tool results",
+        "",
+        "No <tool_call> blocks. Do not write a line like",
+        f"'{NUDGE_TEXT}'",
+    ]
+    return "\n".join(lines)
 
 
 def _corpus(traj: dict) -> str:
@@ -129,12 +180,25 @@ def _key_facts_from_payload(payload: dict) -> list[str]:
         if result is not None:
             facts.append(str(result))
         return facts
-    for k in ("email", "name", "plan", "to", "subject", "condition", "temp_c",
-              "count", "path", "city"):
-        if k in result and result[k] is not None and not isinstance(result[k], bool):
-            s = str(result[k]).strip()
-            if s:
-                facts.append(s)
+    keys = ("email", "name", "plan", "to", "subject", "condition", "temp_c",
+            "count", "path", "city", "value", "doc_id", "event_id", "seats")
+
+    def _collect(obj: dict) -> None:
+        for k in keys:
+            if k in obj and obj[k] is not None and not isinstance(obj[k], bool):
+                s = str(obj[k]).strip()
+                if s:
+                    facts.append(s)
+
+    _collect(result)
+    # Walk dicts one extra level (and one more under those) so owner.email
+    # and billing.plan on crm payloads reach grounding.
+    for v in result.values():
+        if isinstance(v, dict):
+            _collect(v)
+            for v2 in v.values():
+                if isinstance(v2, dict):
+                    _collect(v2)
     if "exists" in result and isinstance(result["exists"], bool):
         facts.append("exists" if result["exists"] else "does not exist")
     rows = result.get("rows")
@@ -144,6 +208,16 @@ def _key_facts_from_payload(payload: dict) -> list[str]:
                 for v in row.values():
                     if v is not None and not isinstance(v, bool):
                         facts.append(str(v))
+    for list_key in ("hits", "events"):
+        items = result.get(list_key)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    for k in ("doc_id", "event_id", "title"):
+                        if k in item and item[k] is not None:
+                            s = str(item[k]).strip()
+                            if s:
+                                facts.append(s)
     err = payload.get("error")
     if isinstance(err, dict):
         if err.get("code"):
@@ -151,6 +225,19 @@ def _key_facts_from_payload(payload: dict) -> list[str]:
         if err.get("message"):
             facts.append(str(err["message"]))
     return facts
+
+
+def _facts_from_step(step: dict) -> list[str]:
+    """Key facts from a step payload plus argument strings."""
+    out = _key_facts_from_payload(step.get("result") or {})
+    for v in (step.get("args") or {}).values():
+        if isinstance(v, str) and len(v.strip()) >= 3:
+            out.append(v.strip())
+        elif not isinstance(v, bool) and v is not None:
+            sv = str(v)
+            if len(sv) >= 2:
+                out.append(sv)
+    return out
 
 
 def validate_answer_grounding(traj: dict, final: str) -> str | None:
@@ -190,17 +277,6 @@ def validate_answer_grounding(traj: dict, final: str) -> str | None:
         if s.get("result", {}).get("status") == 200:
             last_success = s
             break
-
-    def _facts_from_step(step: dict) -> list[str]:
-        out = _key_facts_from_payload(step.get("result") or {})
-        for v in (step.get("args") or {}).values():
-            if isinstance(v, str) and len(v.strip()) >= 3:
-                out.append(v.strip())
-            elif not isinstance(v, bool) and v is not None:
-                sv = str(v)
-                if len(sv) >= 2:
-                    out.append(sv)
-        return out
 
     facts: list[str] = []
     if last_success is not None:
@@ -271,8 +347,10 @@ def assemble_trace(traj: dict, teacher_meta: dict, parsed: dict,
         "plan_template": traj.get("plan_index", -1),
         "plan_id": traj.get("plan_id"),
         "plan_skills": traj.get("skills") or [],
+        "plan_tier": traj.get("tier"),
         "vars": traj.get("vars") or {},
         "distill_version": DISTILL_VERSION,
+        "forge_spec": "0.2",
         "messages": msgs,
         "chain_steps": [
             {"tool": s["tool"], "args": s["args"], "result": s["result"],

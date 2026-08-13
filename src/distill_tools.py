@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import re
@@ -20,21 +21,57 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 import httpx
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from mock_tools import TOOL_DEFINITIONS, execute_tool_calls
 from seed_bank import pick_class, sample_seed
-from agentic_plans import build_chain, validate_chain, trajectory_hash
+from agentic_plans import PLANS, build_chain, validate_chain, trajectory_hash
+from archive_data import archive_raw, default_archive_dir
+from curriculum import pick_plan_index, split_plan_ids
+from dpo_pairs import build_pair
+from eval_card import compute_card, load_traces, stamp_eval
+from verifier import deterministic_repair, should_llm_verify, build_verify_prompt, parse_verify_reply
 from prose_writer import (
-    build_prose_prompt, parse_teacher_output, assemble_trace,
+    build_prose_prompt, build_answer_prompt, parse_teacher_output,
+    parse_thoughts, parse_final, assemble_trace,
     validate_prose_trace, validate_answer_grounding, DISTILL_VERSION,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 ROSTER_PATH = ROOT / "configs" / "roster.yaml"
 OUT_DIR = ROOT / "data" / "raw"
+
+# Top-level roster keys that are never provider ids (flat or wrapped).
+RESERVED_ROSTER_KEYS = frozenset({
+    "backoff", "providers", "roles", "curriculum", "verify", "dpo",
+})
+
+
+def iter_provider_items(roster: dict):
+    """Yield (provider_id, conf) from a flat or providers:-wrapped roster."""
+    if not isinstance(roster, dict):
+        return
+    src = roster.get("providers") if isinstance(roster.get("providers"), dict) else roster
+    for prov, conf in src.items():
+        if prov in RESERVED_ROSTER_KEYS:
+            continue
+        if not isinstance(conf, dict):
+            continue
+        yield prov, conf
+
+
+def shard_keeps(traj_hash: str, shard_i: int, shard_n: int) -> bool:
+    """True iff this trajectory belongs to shard i/N."""
+    if shard_n <= 1:
+        return True
+    return int(str(traj_hash)[:8], 16) % shard_n == shard_i
 
 # Keys: read from environment variables only (see .env / env vars).
 # Never commit credentials. Provider key names are declared in configs/roster.yaml.
@@ -174,7 +211,19 @@ class ModelHealth:
 class Distiller:
     def __init__(self, roster: dict, out_dir: Path, seed: int = 42,
                  provider_filter: list[str] | None = None,
-                 model_filter: list[str] | None = None):
+                 model_filter: list[str] | None = None,
+                 curriculum_mode: str = "uniform",
+                 holdout_frac: float = 0.15,
+                 write_eval_card: bool = True,
+                 stamp_trace_eval: bool = True,
+                 verify_sample: float = 0.2,
+                 no_verify: bool = False,
+                 cross_teacher: bool = False,
+                 cross_teacher_rate: float = 0.3,
+                 dpo_enabled: bool = False,
+                 dpo_rate: float = 1.0,
+                 shard_i: int = 0,
+                 shard_n: int = 1):
         self.roster = roster
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +231,28 @@ class Distiller:
         self.rng = random.Random(seed)  # fallback only; workers get their own
         self.provider_filter = provider_filter
         self.model_filter = set(model_filter) if model_filter else None
+        self.curriculum_mode = curriculum_mode or "uniform"
+        self.holdout_frac = float(holdout_frac)
+        self.write_eval_card = write_eval_card
+        self.stamp_trace_eval = stamp_trace_eval
+        self.verify_sample = float(verify_sample)
+        self.no_verify = bool(no_verify)
+        self.verify_skipped = 0
+        self.cross_teacher = bool(cross_teacher)
+        self.cross_teacher_rate = float(cross_teacher_rate)
+        self.cross_teacher_fallback = 0
+        self._cross_disabled_logged = False
+        self.dpo_enabled = bool(dpo_enabled)
+        self.dpo_rate = float(dpo_rate)
+        self.shard_i = int(shard_i)
+        self.shard_n = max(1, int(shard_n))
+        self.holdout_ids: set[str] = set()
+        if self.holdout_frac > 0:
+            _train, hold = split_plan_ids(PLANS, self.holdout_frac, seed)
+            self.holdout_ids = set(hold)
+            hold_path = self.out_dir / "holdout_plan_ids.json"
+            hold_path.write_text(json.dumps(hold, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8")
         self.external_prompts = self._load_external()
         self.used_trajs: set[str] = set()
         for p in self.out_dir.glob("traces_*.jsonl"):
@@ -198,11 +269,12 @@ class Distiller:
                     self.used_trajs.add(h)
                 elif obj.get("prompt"):
                     self.used_trajs.add(obj["prompt"])
-        # Providers that require OpenAI strict tool protocol (tool_call_id
-        # on tool messages + tool_calls array on assistant turns).
-        # kimcf banned by user. nvdacf NIM, lexzm Zenmux, local-lexg
-        # (opencode zen) all require it.
-        self.strict_tool_ids: dict[str, bool] = {"nvdacf": True, "lexzm": True, "local-lexg": True}
+        # OpenAI strict tool protocol is a per-provider roster flag.
+        self.providers: dict[str, dict] = dict(iter_provider_items(roster))
+        self.strict_tool_ids: dict[str, bool] = {
+            prov: bool(conf.get("strict_tool_protocol", False))
+            for prov, conf in self.providers.items()
+        }
         # Token accounting: per-provider/model input/output usage
         self.token_usage: dict[str, dict] = {}  # "prov/model" -> {"input": int, "output": int}
         self.health: dict[str, ModelHealth] = {}
@@ -212,12 +284,11 @@ class Distiller:
         self.headers: dict[str, dict] = {}
         self.clients: dict[str, httpx.AsyncClient] = {}
         self._client_lock: asyncio.Lock | None = None
-        for prov, conf in roster.items():
-            if prov == "backoff":
-                continue
+        for prov, conf in self.providers.items():
             self.health[prov] = ModelHealth()
             self.semaphores[prov] = asyncio.Semaphore(conf.get("concurrency", 3))
-            key = os.environ.get(conf.get("key_env", ""), "")
+            key_env = conf.get("key_env") or ""
+            key = os.environ.get(key_env, "") if key_env else ""
             self.headers[prov] = {"Authorization": f"Bearer {key}"} if key else {}
             self.checkpoints[prov] = self._load_checkpoint(prov)
             for model in (conf.get("models") or {}):
@@ -251,18 +322,47 @@ class Distiller:
                 return 0
         return 0
 
+    def _locked_append(self, path, line: str) -> None:
+        """POSIX flock around a jsonl append. Checkpoint updates share the same lock."""
+        path = Path(path)
+        name = path.name
+        prov = None
+        if name.startswith("traces_") and name.endswith(".jsonl"):
+            prov = name[len("traces_"):-len(".jsonl")]
+        elif name.startswith("dpo_pairs_") and name.endswith(".jsonl"):
+            prov = name[len("dpo_pairs_"):-len(".jsonl")]
+        lock_path = path.parent / (f".lock_{prov}" if prov else f".lock_{path.stem}")
+        lock_path.touch(exist_ok=True)
+        payload = line if line.endswith("\n") else line + "\n"
+        with open(lock_path, "a+", encoding="utf-8") as lf:
+            if fcntl is not None:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(payload)
+                if prov is not None and name.startswith("traces_"):
+                    self.checkpoints[prov] = self.checkpoints.get(prov, 0) + 1
+                    self._checkpoint_path(prov).write_text(str(self.checkpoints[prov]))
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
     def _append_trace(self, prov: str, trace: dict):
         # STRICT GATE: never write malformed/empty data into the training pool.
-        err = validate_trace(trace)
+        if trace.get("distill_version") == DISTILL_VERSION:
+            err = validate_prose_trace(trace)
+        else:
+            err = validate_trace(trace)
         if err:
             self.health[prov].failed += 1
             return False
         path = self.out_dir / f"traces_{prov}.jsonl"
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(trace, ensure_ascii=False) + "\n")
-        self.checkpoints[prov] += 1
-        self._checkpoint_path(prov).write_text(str(self.checkpoints[prov]))
+        self._locked_append(path, json.dumps(trace, ensure_ascii=False))
         return True
+
+    def _append_dpo(self, prov: str, pair: dict):
+        path = self.out_dir / f"dpo_pairs_{prov}.jsonl"
+        self._locked_append(path, json.dumps(pair, ensure_ascii=False))
 
     # ---- trace generation ----------------------------------------------
     def _system_prompt(self, cls: str) -> str:
@@ -331,7 +431,7 @@ class Distiller:
     async def _chat(self, prov: str, model: str, msgs: list[dict], max_tokens: int,
                     extra_body: dict | None = None) -> dict:
         """POST one chat completion. Returns {ok, data|error, retry_after}."""
-        conf = self.roster[prov]
+        conf = self.providers[prov]
         url = conf["base_url"].rstrip("/") + "/chat/completions"
         body = {"model": model, "messages": msgs, "max_tokens": max_tokens, "stream": False}
         if extra_body:
@@ -529,35 +629,80 @@ class Distiller:
         exported trace share ONE chain (no double build_chain).
         """
         if traj is None:
-            traj = build_chain(rng or self.rng)
+            traj = build_chain(rng or self.rng, exclude_ids=self.holdout_ids)
+        if traj.get("seed_class") not in (None, "agentic"):
+            raise NotImplementedError("non-agentic seed_class is a future extension")
         plan_err = validate_chain(traj["steps"])
         if plan_err:
             return {"ok": False, "error": f"plan: {plan_err}", "http": "PLAN"}
 
         teacher_prompt = build_prose_prompt(traj)
         sys_prompt = self._system_prompt("agentic")
-        msgs = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": teacher_prompt},
-        ]
-        max_tokens = model_conf.get("max_tokens", 1500)
-        extra = model_conf.get("chat_template_kwargs")
-        extra_body = {"chat_template_kwargs": extra} if extra else None
+        rng = rng or self.rng
+        n_steps = len(traj["steps"])
 
-        r1 = await self._chat(prov, model, msgs, max_tokens, extra_body)
+        r1 = await self._chat_user(prov, model, model_conf, teacher_prompt)
         if not r1["ok"]:
             return {"ok": False, "error": r1.get("error"), "http": r1.get("http"),
                     "retry_after": r1.get("retry_after")}
 
-        n_steps = len(traj["steps"])
         blob = r1.get("content") or ""
-        parsed = parse_teacher_output(blob, n_steps)
-        if not parsed and r1.get("reasoning"):
-            parsed = parse_teacher_output(blob + "\n" + r1["reasoning"], n_steps)
-        if not parsed:
+        if r1.get("reasoning"):
+            blob_plus = blob + "\n" + r1["reasoning"]
+        else:
+            blob_plus = blob
+
+        thoughts = parse_thoughts(blob, n_steps) or parse_thoughts(blob_plus, n_steps)
+        if not thoughts:
             return {"ok": False, "error": "could not parse teacher prose", "http": "FORMAT"}
 
+        split = False
+        fallback = False
+        ans_prov = ans_model = None
+        answer_route = None
+        if self.cross_teacher:
+            answer_route = self._select_answer_route(prov, model, rng)
+            if answer_route is None:
+                if not self._cross_disabled_logged:
+                    print("[cross-teacher] only one route in worklist; split disabled")
+                    self._cross_disabled_logged = True
+            elif rng.random() < self.cross_teacher_rate:
+                split = True
+                answer_route = answer_route
+
+        final = None
+        if split and answer_route:
+            ans_prov, ans_model, ans_conf = answer_route
+            ans_prompt = build_answer_prompt(traj, thoughts)
+            r2 = await self._chat_user(ans_prov, ans_model, ans_conf, ans_prompt)
+            if r2.get("ok"):
+                final = parse_final(r2.get("content") or "")
+            if not final:
+                self.cross_teacher_fallback += 1
+                fallback = True
+                r_fb = await self._chat_user(prov, model, model_conf, ans_prompt)
+                if r_fb.get("ok"):
+                    final = parse_final(r_fb.get("content") or "")
+                if not final:
+                    final = parse_final(blob_plus)
+        else:
+            parsed_one = parse_teacher_output(blob, n_steps) or parse_teacher_output(blob_plus, n_steps)
+            if parsed_one:
+                thoughts = parsed_one["thoughts"]
+                final = parsed_one["final"]
+
+        if not thoughts or not final:
+            return {"ok": False, "error": "could not parse teacher prose", "http": "FORMAT"}
+        parsed = {"thoughts": thoughts, "final": final}
+
         gerr = validate_answer_grounding(traj, parsed["final"])
+        repaired = False
+        if gerr:
+            fixed = deterministic_repair(traj, parsed["final"], gerr)
+            if fixed is not None:
+                parsed["final"] = fixed
+                repaired = True
+                gerr = None
         if gerr:
             return {"ok": False, "error": f"grounding: {gerr}", "http": "GROUNDING"}
 
@@ -569,22 +714,66 @@ class Distiller:
         if aerr or trace is None:
             return {"ok": False, "error": f"assemble: {aerr}", "http": "FORMAT"}
         trace["traj_hash"] = trajectory_hash(traj)
+        trace["forge_spec"] = "0.2"
+        if traj.get("tier") and not trace.get("plan_tier"):
+            trace["plan_tier"] = traj["tier"]
         verr = validate_prose_trace(trace)
         if verr:
             return {"ok": False, "error": f"prose validate: {verr}", "http": "FORMAT"}
-        return {"ok": True, "trace": trace, "tool_calls_made": n_steps}
+        vfail = await self._maybe_llm_verify(traj, parsed["final"], repaired, rng or self.rng)
+        if vfail:
+            return {"ok": False, "error": vfail, "http": "VERIFY"}
+        if self.stamp_trace_eval:
+            stamp_eval(trace, traj, repaired=repaired, cross_teacher=False)
+        return {"ok": True, "trace": trace, "tool_calls_made": n_steps, "repaired": repaired}
+
+    async def _maybe_llm_verify(self, traj: dict, final: str, repaired: bool,
+                                rng: random.Random) -> str | None:
+        """Optional PASS/FAIL gate. HTTP/parse failure: skip and keep the trace."""
+        if self.no_verify:
+            return None
+        if not should_llm_verify(repaired, rng, self.verify_sample):
+            return None
+        roles = self.roster.get("roles") if isinstance(self.roster.get("roles"), dict) else {}
+        vrole = (roles or {}).get("verifier") or {}
+        vprov = vrole.get("provider")
+        vmodel = vrole.get("model")
+        if not vprov or not vmodel or vprov not in self.providers:
+            self.verify_skipped += 1
+            return None
+        mconf = (self.providers[vprov].get("models") or {}).get(vmodel) or {}
+        max_tokens = int(mconf.get("max_tokens", 256))
+        extra = mconf.get("chat_template_kwargs")
+        extra_body = {"chat_template_kwargs": extra} if extra else None
+        msgs = [
+            {"role": "system", "content": "You are a strict fact checker. Reply with one line."},
+            {"role": "user", "content": build_verify_prompt(traj, final)},
+        ]
+        try:
+            r = await self._chat(vprov, vmodel, msgs, max_tokens, extra_body)
+        except Exception:
+            self.verify_skipped += 1
+            return None
+        if not r.get("ok"):
+            self.verify_skipped += 1
+            return None
+        verdict = parse_verify_reply(r.get("content") or "")
+        if verdict is None:
+            self.verify_skipped += 1
+            return None
+        if verdict == "fail":
+            return "verifier FAIL"
+        return None
 
     # ---- worker loop ---------------------------------------------------
     def _providers_with_models(self):
-        """Flatten roster to (prov, model, model_conf) skipping backoff config."""
+        """Flatten roster to (prov, model, model_conf) skipping reserved keys."""
         out = []
         filt = set(self.provider_filter) if self.provider_filter else None
-        for prov, conf in self.roster.items():
-            if prov == "backoff" or not isinstance(conf, dict):
-                continue
+        for prov, conf in self.providers.items():
             if filt is not None and prov not in filt:
                 continue
-            for model, mconf in conf.get("models", {}).items():
+            for model, mconf in (conf.get("models") or {}).items():
                 if self.model_filter is not None and model not in self.model_filter:
                     continue
                 out.append((prov, model, mconf))
@@ -596,6 +785,7 @@ class Distiller:
             print("No models in roster!")
             return
         print(f"Roster: {len(worklist)} model routes across {len({p for p,_,_ in worklist})} providers")
+        print("Routes: " + ", ".join(f"{p}/{m}" for p, m, _ in worklist))
         print(f"Distill version: {DISTILL_VERSION}")
 
         tasks = []
@@ -623,21 +813,33 @@ class Distiller:
                     continue
                 traj = None
                 thash = None
-                for _try in range(40):
-                    cand = build_chain(rng)
-                    fh = trajectory_hash(cand)
-                    async with lock:
-                        if fh not in self.used_trajs:
-                            self.used_trajs.add(fh)
-                            traj = cand
-                            thash = fh
-                            break
-                if traj is None:
-                    # Saturated unique space for this draw. Do NOT clear used_trajs.
+                progress = my_slot / max(count, 1)
+                try:
+                    for _try in range(40):
+                        if self.curriculum_mode == "off":
+                            cand = build_chain(rng, exclude_ids=self.holdout_ids)
+                        else:
+                            idx = pick_plan_index(
+                                rng, PLANS, self.curriculum_mode, progress,
+                                self.holdout_ids,
+                            )
+                            cand = build_chain(rng, plan_index=idx,
+                                               exclude_ids=self.holdout_ids)
+                        fh = trajectory_hash(cand)
+                        async with lock:
+                            if fh not in self.used_trajs:
+                                self.used_trajs.add(fh)
+                                traj = cand
+                                thash = fh
+                                break
+                except RuntimeError:
                     async with lock:
                         produced -= 1
-                    await asyncio.sleep(0.05)
-                    continue
+                    raise
+                if traj is None:
+                    async with lock:
+                        produced -= 1
+                    raise RuntimeError("plan space exhausted")
                 async with self.semaphores[prov]:
                     res = await self.generate_agentic_trace(prov, model, mconf, traj=traj, rng=rng)
                 if res.get("ok"):
@@ -659,7 +861,7 @@ class Distiller:
                     http = res.get("http")
                     if http == 429:
                         h.note_429(res.get("retry_after"))
-                    elif http in ("FORMAT", "PLAN", "GROUNDING"):
+                    elif http in ("FORMAT", "PLAN", "GROUNDING", "VERIFY"):
                         mh.note_format_fail()
                     else:
                         h.note_failure()
@@ -684,10 +886,43 @@ class Distiller:
 
         try:
             await asyncio.gather(*tasks)
+        except RuntimeError as e:
+            for t in tasks:
+                t.cancel()
+            print(f"[FAIL] {e}")
+            await self.aclose()
+            raise SystemExit(3)
         finally:
             await self.aclose()
         print(f"\nDone. {produced} traces in {time.time()-started:.0f}s")
         self.print_summary()
+        if self.write_eval_card:
+            self._write_eval_card()
+
+    def _token_usage_for_card(self) -> dict:
+        by_route = {k: dict(v) for k, v in self.token_usage.items()}
+        return {
+            "input": sum(int(v.get("input", 0) or 0) for v in by_route.values()),
+            "output": sum(int(v.get("output", 0) or 0) for v in by_route.values()),
+            "by_route": by_route,
+        }
+
+    def _write_eval_card(self):
+        files = sorted(self.out_dir.glob("traces_*.jsonl"))
+        traces = load_traces(files)
+        hold = sorted(self.holdout_ids)
+        card = compute_card(
+            traces,
+            token_usage=self._token_usage_for_card(),
+            extra={
+                "input_paths": [str(p) for p in files],
+                "holdout_plan_ids": hold,
+            },
+        )
+        out = self.out_dir / "eval_card.json"
+        out.write_text(json.dumps(card, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        print(f"Wrote eval card {out} n_traces={card.get('n_traces', 0)}")
 
     def print_summary(self):
         """Per-model + total token usage and trace counts."""
@@ -717,43 +952,124 @@ class Distiller:
         fmt = sum(mh.format_fail for mh in self.model_health.values())
         gen = sum(mh.generated for mh in self.model_health.values())
         print(f"  Model successes: {gen}   format/grounding fails: {fmt}")
+        print(f"  Verifier skipped: {self.verify_skipped}")
         for key, mh in sorted(self.model_health.items()):
             if mh.generated or mh.format_fail or mh.failed:
                 print(f"    {key:45s} ok {mh.generated:4d}  fmt {mh.format_fail:4d}  fail {mh.failed:4d}  {mh.status}")
 
 
+def _resolve_out_dir(path: str) -> Path:
+    p = Path(path)
+    if not p.is_absolute():
+        p = ROOT / p
+    return p
+
+
+def _pilot_defaults(roster: dict) -> tuple[list[str], list[str]]:
+    """First provider in roster order and that provider's first model."""
+    items = list(iter_provider_items(roster))
+    if not items:
+        return [], []
+    prov, conf = items[0]
+    models = list((conf.get("models") or {}).keys())
+    if not models:
+        return [prov], []
+    return [prov], [models[0]]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--count", type=int, default=100, help="total traces to generate")
-    ap.add_argument("--pilot", action="store_true", help="print every trace (small run); defaults to local-lexg")
+    ap.add_argument("--pilot", action="store_true",
+                    help="print every trace (small run); empty filters use first roster provider/model")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--roster", default=str(ROSTER_PATH))
     ap.add_argument("--providers", default="",
-                    help="comma-separated provider ids to use (default: all, or local-lexg with --pilot)")
+                    help="comma-separated provider ids to use (default: all, or first roster provider with --pilot)")
     ap.add_argument("--models", default="",
-                    help="comma-separated model ids (default: all, or the default pilot model with --pilot)")
+                    help="comma-separated model ids (default: all, or first model of the pilot provider with --pilot)")
     ap.add_argument("--wipe", action="store_true",
-                    help="DELETE existing data/raw traces first. Prefer src/archive_data.py.")
+                    help="archive existing traces via archive_data.py, then proceed. Never unlinks.")
+    ap.add_argument("--out-dir", default=str(OUT_DIR),
+                    help="trace output directory (default: data/raw)")
+    ap.add_argument("--legacy-v1", action="store_true",
+                    help="rejected: legacy-v1 generator is frozen")
+    ap.add_argument("--no-eval-card", action="store_true",
+                    help="skip writing aggregate eval_card.json at end of run")
+    ap.add_argument("--no-trace-eval", action="store_true",
+                    help="omit per-trace eval block (size escape hatch)")
+    ap.add_argument("--curriculum", default=None, choices=("off", "uniform", "linear"),
+                    help="plan-tier mix (default: roster curriculum.mode or uniform)")
+    ap.add_argument("--holdout-frac", type=float, default=None,
+                    help="fraction of plan ids held out of training (default: 0.15)")
+    ap.add_argument("--verify-sample", type=float, default=None,
+                    help="LLM-verify sample rate for already-passing traces (default: 0.2)")
+    ap.add_argument("--no-verify", action="store_true",
+                    help="skip LLM verifier calls; deterministic repair still runs")
     args = ap.parse_args()
 
+    if args.legacy_v1:
+        print("legacy-v1 is frozen; reversed-v2 is the only supported generator")
+        raise SystemExit(2)
+
+    out_dir = _resolve_out_dir(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # SAFETY GUARD: never silently overwrite existing data.
-    existing = list(OUT_DIR.glob("traces_*.jsonl"))
+    existing = list(out_dir.glob("traces_*.jsonl"))
     if existing and not args.wipe:
-        print(f"[GUARD] data/raw already has {len(existing)} trace file(s).")
+        print(f"[GUARD] {out_dir} already has {len(existing)} trace file(s).")
         print("[GUARD] Run src/archive_data.py to archive them, then relaunch.")
-        print("[GUARD] Or pass --wipe if you truly want to delete (not recommended).")
+        print("[GUARD] Or pass --wipe to archive existing traces, then proceed.")
         raise SystemExit(1)
+
+    if existing and args.wipe:
+        try:
+            archive_raw(
+                raw_dir=out_dir,
+                archive_dir=default_archive_dir(out_dir),
+                label="wipe",
+            )
+        except Exception as e:
+            print(f"[GUARD] archive failed: {e}")
+            raise SystemExit(1)
+        leftover = list(out_dir.glob("traces_*.jsonl"))
+        if leftover:
+            print(f"[GUARD] archive left {len(leftover)} trace file(s) in place; refusing to continue.")
+            raise SystemExit(1)
 
     roster = yaml.safe_load(Path(args.roster).read_text())
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     if args.pilot and not providers:
-        providers = ["local-lexg"]
-    if args.pilot and not models:
-        models = ["deepseek-v4-flash-free"]
-    d = Distiller(roster, OUT_DIR, seed=args.seed,
+        pdef, mdef = _pilot_defaults(roster)
+        providers = pdef
+        if not models:
+            models = mdef
+    elif args.pilot and not models:
+        _, mdef = _pilot_defaults(roster)
+        # If a provider filter is set, use that provider's first model.
+        if providers:
+            pmap = dict(iter_provider_items(roster))
+            conf = pmap.get(providers[0]) or {}
+            mk = list((conf.get("models") or {}).keys())
+            models = [mk[0]] if mk else mdef
+        else:
+            models = mdef
+    cur_conf = (roster or {}).get("curriculum") or {}
+    curriculum_mode = args.curriculum if args.curriculum is not None else cur_conf.get("mode", "uniform")
+    holdout_frac = args.holdout_frac if args.holdout_frac is not None else float(cur_conf.get("holdout_frac", 0.15))
+    ver_conf = (roster or {}).get("verify") or {}
+    verify_sample = args.verify_sample if args.verify_sample is not None else float(ver_conf.get("sample_rate", 0.2))
+    d = Distiller(roster, out_dir, seed=args.seed,
                   provider_filter=providers or None,
-                  model_filter=models or None)
+                  model_filter=models or None,
+                  curriculum_mode=curriculum_mode,
+                  holdout_frac=holdout_frac,
+                  write_eval_card=not args.no_eval_card,
+                  stamp_trace_eval=not args.no_trace_eval,
+                  verify_sample=verify_sample,
+                  no_verify=args.no_verify)
     asyncio.run(d.run(args.count, pilot=args.pilot))
 
 

@@ -3,7 +3,7 @@
 # data/archive/YYYYMMDD-HHMMSS/ before starting a fresh run, then
 # launches the distiller with a raised fd limit.
 #
-# Usage: ./safe_launch.sh [--count N] [--no-archive]
+# Usage: ./safe_launch.sh [--count N] [--out-dir DIR] [--no-archive] [other distill flags]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -13,27 +13,33 @@ if [ -f ".env" ]; then
   echo "[safe_launch] loaded credentials from .env"
 fi
 
-COUNT="${1:-}"
-if [ "$COUNT" = "--count" ]; then COUNT="$2"; fi
+COUNT=15000
 ARCHIVE=1
-for a in "$@"; do
-  [ "$a" = "--no-archive" ] && ARCHIVE=0
+EXTRA=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --count)
+      COUNT="$2"
+      shift 2
+      ;;
+    --no-archive)
+      ARCHIVE=0
+      shift
+      ;;
+    --out-dir)
+      EXTRA+=("$1" "$2")
+      shift 2
+      ;;
+    --wipe)
+      echo "[safe_launch] refusing --wipe; archive via src/archive_data.py instead" >&2
+      exit 1
+      ;;
+    *)
+      EXTRA+=("$1")
+      shift
+      ;;
+  esac
 done
-[ -n "$COUNT" ] || COUNT=15000
-
-RAW="data/raw"
-if [ "$ARCHIVE" = "1" ] && ls "$RAW"/traces_*.jsonl >/dev/null 2>&1; then
-  TS=$(date +%Y%m%d-%H%M%S)
-  DEST="data/archive/$TS"
-  mkdir -p "$DEST"
-  mv "$RAW"/traces_*.jsonl "$RAW"/checkpoint_*.json "$DEST"/ 2>/dev/null || true
-  echo "[safe_launch] archived existing traces -> $DEST"
-else
-  echo "[safe_launch] no existing traces to archive (or --no-archive)"
-fi
-
-ulimit -n 65536
-echo "[safe_launch] launching: count=$COUNT, fd_limit=$(ulimit -n)"
 
 PY=""
 if [ -x ".venv/bin/python" ]; then PY=".venv/bin/python"
@@ -42,4 +48,15 @@ else
   echo "[safe_launch] ERROR: no python found" >&2
   exit 1
 fi
-exec env PYTHONUNBUFFERED=1 "$PY" src/distill_tools.py --count "$COUNT"
+
+RAW="data/raw"
+if [ "$ARCHIVE" = "1" ]; then
+  "$PY" src/archive_data.py --label pre-launch || true
+else
+  echo "[safe_launch] no existing traces to archive (or --no-archive)"
+fi
+
+ulimit -n 65536
+echo "[safe_launch] launching: count=$COUNT, fd_limit=$(ulimit -n)"
+
+exec env PYTHONUNBUFFERED=1 "$PY" src/distill_tools.py --count "$COUNT" "${EXTRA[@]}"
