@@ -18,6 +18,8 @@ from eval_card import (
     stamp_eval,
 )
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
 PY = sys.executable
 EVAL = str(REPO / "src" / "eval_card.py")
@@ -56,9 +58,9 @@ def test_load_traces_dir_ignores_non_trace_files(tmp_path: Path):
 
 
 def test_compute_card_gates_clean_on_mini_traces():
-    traces = load_traces([FIXTURES])
+    traces = load_traces([MINI])
     assert len(traces) >= 3
-    card = compute_card(traces, extra={"input_paths": [str(FIXTURES)]})
+    card = compute_card(traces, extra={"input_paths": [str(MINI)]})
     g = card["gates"]
     assert g["validate_prose_trace_pass"] == 1.0
     assert g["validate_answer_grounding_pass"] == 1.0
@@ -135,8 +137,15 @@ def test_fidelity_fails_on_guessed_send_email_to():
 
 
 def test_cli_fixtures_require_gates_exits_0():
+    r = _run(["--input", str(MINI), "--require-gates"])
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_cli_fixtures_dir_require_gates_nonzero():
     r = _run(["--input", str(FIXTURES), "--require-gates"])
     assert r.returncode == 0, r.stdout + r.stderr
+    card = json.loads(r.stdout)
+    assert card["n_traces"] >= 3
 
 
 def test_stamp_eval_writes_forge_spec_and_eval():
@@ -164,6 +173,55 @@ def test_stamp_eval_writes_forge_spec_and_eval():
     assert ev["tier"] == "hard"
     assert ev["repaired"] is False
     assert ev["cross_teacher"] is False
+    assert "cross_teacher_fallback" not in ev
+
+
+def test_compute_card_cross_teacher_structure_rates():
+    base = _copy_fixture_line(0)
+    split = json.loads(json.dumps(base))
+    split["teacher_thoughts"] = "p1/m1"
+    split["teacher_answer"] = "p2/m2"
+    fallback = json.loads(json.dumps(base))
+    fallback.pop("teacher_thoughts", None)
+    fallback.pop("teacher_answer", None)
+    ev = dict(fallback.get("eval") or {})
+    ev["cross_teacher_fallback"] = True
+    fallback["eval"] = ev
+    plain = json.loads(json.dumps(base))
+    plain.pop("teacher_thoughts", None)
+    plain.pop("teacher_answer", None)
+    if isinstance(plain.get("eval"), dict):
+        plain["eval"].pop("cross_teacher_fallback", None)
+    card = compute_card([split, fallback, plain])
+    assert card["structure"]["cross_teacher_split_rate"] == pytest.approx(1 / 3)
+    assert card["structure"]["cross_teacher_fallback_rate"] == pytest.approx(1 / 3)
+
+
+def test_cli_dir_loads_holdout_and_token_sidecars(tmp_path: Path):
+    traces = load_traces([MINI])
+    assert traces
+    (tmp_path / "traces_x.jsonl").write_text(
+        json.dumps(traces[0], ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (tmp_path / "holdout_plan_ids.json").write_text(
+        json.dumps(["plan-hold-1", "plan-hold-2"]) + "\n", encoding="utf-8"
+    )
+    (tmp_path / ".token_usage_0.json").write_text(
+        json.dumps({
+            "input": 7,
+            "output": 3,
+            "by_route": {"p/m": {"input": 7, "output": 3}},
+        }),
+        encoding="utf-8",
+    )
+    out = tmp_path / "card.json"
+    r = _run(["--input", str(tmp_path), "--out", str(out)])
+    assert r.returncode == 0, r.stdout + r.stderr
+    card = json.loads(out.read_text(encoding="utf-8"))
+    assert card["holdout_plan_ids"] == ["plan-hold-1", "plan-hold-2"]
+    assert card["tokens"]["input"] == 7
+    assert card["tokens"]["output"] == 3
+    assert card["tokens"]["by_route"]["p/m"] == {"input": 7, "output": 3}
 
 
 def test_require_gates_fails_on_nudge_leak(tmp_path: Path):
@@ -188,3 +246,5 @@ def test_empty_traces_pass_rates_are_one():
     assert card["gates"]["nudge_leak_rate"] == 0.0
     assert card["gates"]["malformed_tool_call_rate"] == 0.0
     assert card["structure"]["send_email_learned_address_rate"] == 1.0
+    assert card["structure"]["cross_teacher_split_rate"] == 0.0
+    assert card["structure"]["cross_teacher_fallback_rate"] == 0.0

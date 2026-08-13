@@ -454,6 +454,25 @@ def export_path(input_glob, out_path, template, tokenizer=None, *, fmt="messages
     return records
 
 
+def write_mask_audit(records, template, dest: Path, command: str = "") -> None:
+    """Write first 3 traj_hash values and trainable-span counts from message_loss_spans."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "mask_audit: first 3 traj_hash values and trainable-span counts",
+    ]
+    if command:
+        lines.append("command: " + command)
+        lines.append("")
+    for rec in list(records or [])[:3]:
+        msgs = rec.get("messages") or []
+        spans = message_loss_spans(msgs, template)
+        n_train = sum(1 for _s, _e, tr in spans if tr)
+        h = rec.get("traj_hash") or ""
+        lines.append(f"{h}\ttrainable_spans={n_train}\ttotal_spans={len(spans)}")
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _load_hf_tokenizer(path: str):
     try:
         from transformers import AutoTokenizer
@@ -474,7 +493,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", required=True, type=Path, help="write SFT jsonl here")
     ap.add_argument("--template", required=True, type=Path, help="template JSON path")
     ap.add_argument(
-        "--format", dest="fmt", choices=("messages", "rendered"), default="messages",
+        "--format",
+        dest="fmt",
+        choices=("messages", "rendered"),
+        default="messages",
+        help="messages: chat list + trainable_roles; rendered: add text + loss_char_spans",
     )
     ap.add_argument("--check-mask", action="store_true", help="assert assistant-only loss")
     ap.add_argument(
@@ -502,6 +525,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.check_mask:
             for rec in records:
                 check_loss_mask({**rec, "_template": template}, None)
+            flag_src = argv if argv is not None else sys.argv[1:]
+            cmd = "python src/export_sft.py " + " ".join(str(x) for x in flag_src)
+            write_mask_audit(
+                records,
+                template,
+                Path(args.out).parent / "mask_audit.txt",
+                command=cmd,
+            )
         if do_tok:
             n = max(0, args.n_check)
             for rec in records[:n]:

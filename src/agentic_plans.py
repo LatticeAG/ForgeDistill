@@ -438,7 +438,7 @@ PLANS = [
         "id": "idempotent-reuse-email",
         "skills": ["idempotent", "recovery", "schema"],
         "tier": "hard",
-        "prompt": "Look up user {uid} once, then email them '{subject}'. If the first send is rejected, retry the send using the email you already learned — do not look the user up again.",
+        "prompt": "Look up user {uid} once, then email them '{subject}'. If the first send is rejected, retry the send using the email you already learned - do not look the user up again.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
             {"tool": "send_email", "args": {"to": "$0.result.email", "subject": "", "body": "Hi $0.result.name."}, "expect": "error"},
@@ -476,7 +476,7 @@ PLANS = [
         "id": "guess-email-then-correct",
         "skills": ["recovery"],
         "tier": "hard",
-        "prompt": "Email user {uid} about '{subject}'. If you guess their address it will fail — look them up and send to the registered address.",
+        "prompt": "Email user {uid} about '{subject}'. If you guess their address it will fail - look them up and send to the registered address.",
         "plan": [
             {"tool": "send_email", "args": {"to": "{guessed_email}", "subject": "{subject}", "body": "Hello."}, "expect": "error"},
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
@@ -515,7 +515,7 @@ PLANS = [
         "id": "stop-after-welcome",
         "skills": ["stop", "multi_hop"],
         "tier": "easy",
-        "prompt": "Look up user {uid} and send a single welcome email to their registered address. Stop after that send succeeds — do not make extra tool calls.",
+        "prompt": "Look up user {uid} and send a single welcome email to their registered address. Stop after that send succeeds - do not make extra tool calls.",
         "plan": [
             {"tool": "get_user", "args": {"user_id": "{uid}"}},
             {"tool": "send_email", "args": {"to": "$0.result.email", "subject": "Welcome to the platform",

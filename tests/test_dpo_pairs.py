@@ -246,8 +246,9 @@ def test_pair_id_sha256():
 
 
 def test_offline_cli_over_fixtures(tmp_path: Path):
+    mini = FIXTURES / "mini_traces.jsonl"
     out = tmp_path / "dpo_pairs_offline.jsonl"
-    r = _run(["--input", str(FIXTURES), "--out", str(out), "--dpo-rate", "1.0"])
+    r = _run(["--input", str(mini), "--out", str(out), "--dpo-rate", "1.0"])
     assert r.returncode == 0, r.stdout + r.stderr
     assert out.is_file()
     pairs = [
@@ -255,8 +256,8 @@ def test_offline_cli_over_fixtures(tmp_path: Path):
         for line in out.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    traces = load_traces([FIXTURES])
-    assert traces, "fixtures must expose traces_*.jsonl"
+    traces = load_traces([mini])
+    assert traces
     assert len(pairs) >= 1
     assert len(pairs) <= len(traces)
     muts = {p["mutation"] for p in pairs}
@@ -271,10 +272,63 @@ def test_offline_cli_over_fixtures(tmp_path: Path):
         assert p["rejected"]["messages"]
 
 
+def test_online_dpo_stamps_pair_id_not_flawed_text(tmp_path: Path):
+    from distill_tools import Distiller
+
+    chosen, traj = _assemble("user-email-welcome")
+    pair = build_pair(chosen, traj, random.Random(0))
+    assert pair is not None
+    assert "dpo_pair_id" not in chosen
+    chosen["dpo_pair_id"] = pair["pair_id"]
+    assert "flawed_variant" not in chosen
+    roster = {
+        "p": {
+            "base_url": "http://127.0.0.1:9/v1",
+            "key_env": "",
+            "concurrency": 1,
+            "models": {"m": {"mode": "concise", "max_tokens": 8, "weight": 1}},
+        }
+    }
+    d = Distiller(roster, tmp_path, holdout_frac=0, dpo_enabled=True, write_eval_card=False)
+    wrote = d._append_trace("p", chosen)
+    assert wrote is True
+    d._append_dpo("p", pair)
+    sft = json.loads((tmp_path / "traces_p.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert sft["dpo_pair_id"] == pair["pair_id"]
+    assert "flawed_variant" not in sft
+    dpo = json.loads((tmp_path / "dpo_pairs_p.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert dpo["pair_id"] == pair["pair_id"]
+    assert DPO_FAKE_EMAIL not in json.dumps(sft)
+    assert DPO_FAKE_NUMBER not in json.dumps(sft)
+
+
+def test_online_dpo_discards_pair_when_sft_rejected(tmp_path: Path):
+    from distill_tools import Distiller
+
+    roster = {
+        "p": {
+            "base_url": "http://127.0.0.1:9/v1",
+            "key_env": "",
+            "concurrency": 1,
+            "models": {"m": {"mode": "concise", "max_tokens": 8, "weight": 1}},
+        }
+    }
+    d = Distiller(roster, tmp_path, holdout_frac=0, dpo_enabled=True, write_eval_card=False)
+    bad = {"distill_version": "reversed-v2", "messages": [], "dpo_pair_id": "orphan"}
+    pair = {"pair_id": "orphan", "rejected": {"messages": [{"role": "assistant", "content": "x"}]}}
+    wrote = d._append_trace("p", bad)
+    assert wrote is False
+    assert not (tmp_path / "traces_p.jsonl").exists()
+    if wrote:
+        d._append_dpo("p", pair)
+    assert not (tmp_path / "dpo_pairs_p.jsonl").exists()
+
+
 def test_dpo_rewrite_prose_exits_2(tmp_path: Path):
+    mini = FIXTURES / "mini_traces.jsonl"
     r = _run([
         "--dpo-rewrite-prose",
-        "--input", str(FIXTURES),
+        "--input", str(mini),
         "--out", str(tmp_path / "nope.jsonl"),
     ])
     assert r.returncode == 2

@@ -126,3 +126,48 @@ def test_pilot_defaults_to_first_roster_provider_and_model(tmp_raw: Path):
     assert "example-model-thinking" in combined
     # First provider only: local-router must not be selected when filters are empty.
     assert "local-router" not in combined or "1 model routes" in combined or "1 model route" in combined
+
+
+def test_example_roster_documents_roles():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    assert "roles:" in text
+    assert "verifier:" in text
+    assert "answer:" in text
+
+
+def test_mp_zero_exits_2(tmp_raw: Path):
+    r = _run([
+        "--mp", "0",
+        "--count", "0",
+        "--out-dir", str(tmp_raw),
+        "--roster", str(EXAMPLE),
+        "--holdout-frac", "0",
+    ])
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+def test_mp_plus_explicit_shard_exits_2(tmp_raw: Path):
+    r = _run([
+        "--mp", "2",
+        "--shard", "1/2",
+        "--count", "0",
+        "--out-dir", str(tmp_raw),
+        "--roster", str(EXAMPLE),
+        "--holdout-frac", "0",
+    ])
+    assert r.returncode == 2, r.stdout + r.stderr
+    msg = r.stdout + r.stderr
+    assert "do not combine --mp with explicit --shard" in msg
+
+
+def test_mp_rejects_holdout_only_dir(tmp_raw: Path):
+    (tmp_raw / "holdout_plan_ids.json").write_text("[]\n", encoding="utf-8")
+    r = _run([
+        "--mp", "2",
+        "--count", "0",
+        "--out-dir", str(tmp_raw),
+        "--roster", str(EXAMPLE),
+        "--holdout-frac", "0",
+    ])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "archive or wipe before --mp" in (r.stdout + r.stderr)

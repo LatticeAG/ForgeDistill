@@ -37,3 +37,6 @@ build/
 .vscode/
 .DS_Store
 *.swp
+
+# internal loop checklist
+*PROD-READINESS*.md

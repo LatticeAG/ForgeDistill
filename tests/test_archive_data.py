@@ -20,6 +20,10 @@ def test_move_not_copy_and_dest_exists(tmp_path: Path):
     ckpt.write_text("1", encoding="utf-8")
     (raw / "eval_card.json").write_text("{}", encoding="utf-8")
     (raw / "holdout_plan_ids.json").write_text("[]", encoding="utf-8")
+    dpo = raw / "dpo_pairs_x.jsonl"
+    dpo.write_text('{"pair_id": "p1"}\n', encoding="utf-8")
+    token_sidecar = raw / ".token_usage_0.json"
+    token_sidecar.write_text('{"input": 1, "output": 2}', encoding="utf-8")
 
     dest = archive_data.archive_raw(
         raw_dir=raw,
@@ -35,6 +39,10 @@ def test_move_not_copy_and_dest_exists(tmp_path: Path):
     assert (dest / "checkpoint_example-provider.json").is_file()
     assert (dest / "eval_card.json").is_file()
     assert (dest / "holdout_plan_ids.json").is_file()
+    assert (dest / "dpo_pairs_x.jsonl").is_file()
+    assert (dest / ".token_usage_0.json").is_file()
+    assert not dpo.exists()
+    assert not token_sidecar.exists()
     # Source files were moved, not copied.
     assert traces.read_text() if traces.exists() else True
     assert list(raw.glob("traces_*.jsonl")) == []

@@ -35,6 +35,7 @@ def files_to_archive(raw_dir: Path) -> list[Path]:
     out.extend(sorted(raw_dir.glob("traces_*.jsonl")))
     out.extend(sorted(raw_dir.glob("checkpoint_*.json")))
     out.extend(sorted(raw_dir.glob("dpo_pairs_*.jsonl")))
+    out.extend(sorted(raw_dir.glob(".token_usage_*.json")))
     for name in _EXTRA_NAMES:
         p = raw_dir / name
         if p.is_file():

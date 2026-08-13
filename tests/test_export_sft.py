@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parent.parent
 PY = sys.executable
 EXPORT = str(REPO / "src" / "export_sft.py")
 FIXTURES = REPO / "tests" / "fixtures"
-TRACES_MINI = FIXTURES / "traces_mini.jsonl"
+MINI_TRACES = FIXTURES / "mini_traces.jsonl"
 TEMPLATES = REPO / "configs" / "templates"
 NANBEIGE = TEMPLATES / "nanbeige.json"
 CHATML = TEMPLATES / "chatml.json"
@@ -49,7 +49,7 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 
 def _fixture_traces() -> list[dict]:
-    return _load_jsonl(TRACES_MINI)
+    return _load_jsonl(MINI_TRACES)
 
 
 def test_template_files_assistant_only_loss():
@@ -120,7 +120,7 @@ def test_nudge_absent_in_fixtures_and_export(tmp_path: Path):
         }
         check_loss_mask(rec, None)
     out = tmp_path / "sft.jsonl"
-    records = export_path(TRACES_MINI, out, tmpl, fmt="messages")
+    records = export_path(MINI_TRACES, out, tmpl, fmt="messages")
     for rec in records:
         assert NUDGE_TEXT not in json.dumps(rec, ensure_ascii=False)
         check_loss_mask({**rec, "_template": tmpl}, None)
@@ -181,7 +181,7 @@ def test_tokenize_and_mask_whitespace_assistant_only():
 def test_cli_check_mask_exits_0_on_fixtures(tmp_path: Path):
     out = tmp_path / "nanbeige.jsonl"
     r = _run([
-        "--input", str(TRACES_MINI),
+        "--input", str(MINI_TRACES),
         "--out", str(out),
         "--template", str(NANBEIGE),
         "--format", "messages",
@@ -197,6 +197,12 @@ def test_cli_check_mask_exits_0_on_fixtures(tmp_path: Path):
         assert rec.get("traj_hash")
         assert rec["messages"]
         assert "text" not in rec
+    audit = tmp_path / "mask_audit.txt"
+    assert audit.is_file() and audit.stat().st_size > 0
+    audit_text = audit.read_text(encoding="utf-8")
+    for rec in rows[:3]:
+        assert rec["traj_hash"] in audit_text
+    assert "trainable_spans=" in audit_text
 
 
 def test_export_does_not_ingest_dpo_pairs(tmp_path: Path):
@@ -225,7 +231,7 @@ def test_export_does_not_ingest_dpo_pairs(tmp_path: Path):
 def test_rendered_chatml_writes_jinja_next_to_out(tmp_path: Path):
     out = tmp_path / "ov.jsonl"
     tmpl = load_template(CHATML)
-    records = export_path(TRACES_MINI, out, tmpl, fmt="rendered")
+    records = export_path(MINI_TRACES, out, tmpl, fmt="rendered")
     jinja = tmp_path / "chat_template.jinja"
     assert jinja.is_file()
     body = jinja.read_text(encoding="utf-8")
@@ -236,7 +242,7 @@ def test_rendered_chatml_writes_jinja_next_to_out(tmp_path: Path):
     assert "loss_char_spans" in records[0]
     assert "<tool_response>" in records[0]["text"]
     r = _run([
-        "--input", str(TRACES_MINI),
+        "--input", str(MINI_TRACES),
         "--out", str(tmp_path / "cli.jsonl"),
         "--template", str(CHATML),
         "--format", "rendered",

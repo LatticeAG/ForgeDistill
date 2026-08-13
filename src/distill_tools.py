@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import math
+import multiprocessing
 import os
 import random
 import re
@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from mock_tools import TOOL_DEFINITIONS, execute_tool_calls
 from seed_bank import pick_class, sample_seed
 from agentic_plans import PLANS, build_chain, validate_chain, trajectory_hash
-from archive_data import archive_raw, default_archive_dir
+from archive_data import archive_raw, default_archive_dir, files_to_archive
 from curriculum import pick_plan_index, split_plan_ids
 from dpo_pairs import build_pair
 from eval_card import compute_card, load_traces, stamp_eval
@@ -72,6 +72,78 @@ def shard_keeps(traj_hash: str, shard_i: int, shard_n: int) -> bool:
     if shard_n <= 1:
         return True
     return int(str(traj_hash)[:8], 16) % shard_n == shard_i
+
+
+def parse_shard(s: str) -> tuple[int, int]:
+    """Parse 0-indexed i/N. Raises SystemExit(2) on bad input."""
+    raw = str(s)
+    parts = raw.split("/")
+    if len(parts) != 2:
+        print(f"invalid --shard {raw}; expected i/N")
+        raise SystemExit(2)
+    try:
+        i = int(parts[0])
+        n = int(parts[1])
+    except ValueError:
+        print(f"invalid --shard {raw}; expected i/N")
+        raise SystemExit(2)
+    if n < 1 or i < 0 or i >= n:
+        print(f"invalid --shard {raw}; expected i/N")
+        raise SystemExit(2)
+    return i, n
+
+
+def parse_mp(n: int) -> int:
+    n = int(n)
+    if n < 1:
+        print("invalid --mp; expected integer >= 1")
+        raise SystemExit(2)
+    return n
+
+
+def split_counts(total: int, n: int) -> list[int]:
+    """Partition total into n buckets. split_counts(21, 2) == [11, 10]."""
+    n = int(n)
+    total = int(total)
+    if n < 1:
+        print("invalid --mp; expected integer >= 1")
+        raise SystemExit(2)
+    q, r = divmod(total, n)
+    return [q + (1 if i < r else 0) for i in range(n)]
+
+
+def merge_token_usage(out_dir) -> dict:
+    """Sum .token_usage_*.json sidecars. Zeros if none exist. Never invents counts."""
+    out_dir = Path(out_dir)
+    merged = {"input": 0, "output": 0, "by_route": {}}
+    if not out_dir.is_dir():
+        return merged
+    for p in sorted(out_dir.glob(".token_usage_*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        merged["input"] += int(data.get("input", 0) or 0)
+        merged["output"] += int(data.get("output", 0) or 0)
+        by_route = data.get("by_route") or {}
+        if not isinstance(by_route, dict):
+            continue
+        for route, usage in by_route.items():
+            slot = merged["by_route"].setdefault(str(route), {"input": 0, "output": 0})
+            if not isinstance(usage, dict):
+                continue
+            slot["input"] += int(usage.get("input", 0) or 0)
+            slot["output"] += int(usage.get("output", 0) or 0)
+    return merged
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    path = Path(path)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 # Keys: read from environment variables only (see .env / env vars).
 # Never commit credentials. Provider key names are declared in configs/roster.yaml.
@@ -242,17 +314,20 @@ class Distiller:
         self.cross_teacher_rate = float(cross_teacher_rate)
         self.cross_teacher_fallback = 0
         self._cross_disabled_logged = False
+        self._pin_unused_logged = False
         self.dpo_enabled = bool(dpo_enabled)
         self.dpo_rate = float(dpo_rate)
         self.shard_i = int(shard_i)
         self.shard_n = max(1, int(shard_n))
         self.holdout_ids: set[str] = set()
-        if self.holdout_frac > 0:
+        hold_path = self.out_dir / "holdout_plan_ids.json"
+        if hold_path.exists():
+            loaded = json.loads(hold_path.read_text(encoding="utf-8"))
+            self.holdout_ids = set(loaded)
+        elif self.holdout_frac > 0:
             _train, hold = split_plan_ids(PLANS, self.holdout_frac, seed)
             self.holdout_ids = set(hold)
-            hold_path = self.out_dir / "holdout_plan_ids.json"
-            hold_path.write_text(json.dumps(hold, ensure_ascii=False, indent=2) + "\n",
-                                 encoding="utf-8")
+            _atomic_write_json(hold_path, hold)
         self.external_prompts = self._load_external()
         self.used_trajs: set[str] = set()
         for p in self.out_dir.glob("traces_*.jsonl"):
@@ -461,6 +536,33 @@ class Distiller:
         except ValueError:
             retry_after = None
         return {"ok": False, "http": r.status_code, "error": r.text[:200], "retry_after": retry_after}
+
+    async def _chat_user(self, prov: str, model: str, model_conf: dict, user_content: str) -> dict:
+        """One user-turn completion. Teachers receive prose prompts only."""
+        conf = model_conf or {}
+        max_tokens = int(conf.get("max_tokens", 2000))
+        extra = conf.get("chat_template_kwargs")
+        extra_body = {"chat_template_kwargs": extra} if extra else None
+        msgs = [{"role": "user", "content": user_content}]
+        return await self._chat(prov, model, msgs, max_tokens, extra_body)
+
+    def _select_answer_route(self, thought_prov, thought_model, rng):
+        """Pin wins. Sampling never overrides a valid pin. None if no other route."""
+        work = self._providers_with_models()
+        roles = self.roster.get("roles") if isinstance(self.roster.get("roles"), dict) else {}
+        pin = (roles or {}).get("answer") or {}
+        pprov, pmodel = pin.get("provider"), pin.get("model")
+        if pprov and pmodel:
+            for p, m, c in work:
+                if (p, m) == (pprov, pmodel) and (p, m) != (thought_prov, thought_model):
+                    return (p, m, c)
+            if not self._pin_unused_logged:
+                print("[cross-teacher] roles.answer pin unused; sampling")
+                self._pin_unused_logged = True
+        others = [(p, m, c) for p, m, c in work if (p, m) != (thought_prov, thought_model)]
+        if not others:
+            return None
+        return rng.choice(others)
 
     def _parse_turn(self, content: str) -> tuple[str | None, list[dict] | None]:
         """Extract <thought> and <tool_call> from assistant content."""
@@ -724,7 +826,15 @@ class Distiller:
         if vfail:
             return {"ok": False, "error": vfail, "http": "VERIFY"}
         if self.stamp_trace_eval:
-            stamp_eval(trace, traj, repaired=repaired, cross_teacher=False)
+            if split and answer_route and not fallback:
+                trace["teacher_thoughts"] = f"{prov}/{model}"
+                trace["teacher_answer"] = f"{ans_prov}/{ans_model}"
+                stamp_eval(trace, traj, repaired=repaired, cross_teacher=True)
+            elif fallback:
+                stamp_eval(trace, traj, repaired=repaired, cross_teacher=False,
+                           cross_teacher_fallback=True)
+            else:
+                stamp_eval(trace, traj, repaired=repaired, cross_teacher=False)
         return {"ok": True, "trace": trace, "tool_calls_made": n_steps, "repaired": repaired}
 
     async def _maybe_llm_verify(self, traj: dict, final: str, repaired: bool,
@@ -802,18 +912,14 @@ class Distiller:
                 async with lock:
                     if produced >= count:
                         return
-                    produced += 1
-                    my_slot = produced
                 h = self.health[prov]
                 mh = self.model_health[route]
                 if not h.available() or not mh.available():
                     await asyncio.sleep(0.5)
-                    async with lock:
-                        produced -= 1
                     continue
                 traj = None
                 thash = None
-                progress = my_slot / max(count, 1)
+                progress = (produced + 1) / max(count, 1)
                 try:
                     for _try in range(40):
                         if self.curriculum_mode == "off":
@@ -826,6 +932,8 @@ class Distiller:
                             cand = build_chain(rng, plan_index=idx,
                                                exclude_ids=self.holdout_ids)
                         fh = trajectory_hash(cand)
+                        if not shard_keeps(fh, self.shard_i, self.shard_n):
+                            continue
                         async with lock:
                             if fh not in self.used_trajs:
                                 self.used_trajs.add(fh)
@@ -833,16 +941,24 @@ class Distiller:
                                 thash = fh
                                 break
                 except RuntimeError:
-                    async with lock:
-                        produced -= 1
                     raise
                 if traj is None:
-                    async with lock:
-                        produced -= 1
                     raise RuntimeError("plan space exhausted")
+                async with lock:
+                    if produced >= count:
+                        if thash:
+                            self.used_trajs.discard(thash)
+                        return
+                    produced += 1
+                    my_slot = produced
                 async with self.semaphores[prov]:
                     res = await self.generate_agentic_trace(prov, model, mconf, traj=traj, rng=rng)
                 if res.get("ok"):
+                    pair = None
+                    if self.dpo_enabled and rng.random() < self.dpo_rate:
+                        pair = build_pair(res["trace"], traj, rng)
+                        if pair:
+                            res["trace"]["dpo_pair_id"] = pair["pair_id"]
                     wrote = self._append_trace(prov, res["trace"])
                     if not wrote:
                         mh.note_format_fail()
@@ -852,6 +968,8 @@ class Distiller:
                                 self.used_trajs.discard(thash)
                         print(f"  [REJ] {route} rejected by validator: {res['trace'].get('seed_class')}")
                     else:
+                        if pair is not None:
+                            self._append_dpo(prov, pair)
                         h.note_success()
                         mh.note_success()
                         if my_slot % 5 == 0 or pilot:
@@ -896,6 +1014,11 @@ class Distiller:
             await self.aclose()
         print(f"\nDone. {produced} traces in {time.time()-started:.0f}s")
         self.print_summary()
+        sidecar = self.out_dir / f".token_usage_{self.shard_i}.json"
+        sidecar.write_text(
+            json.dumps(self._token_usage_for_card(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         if self.write_eval_card:
             self._write_eval_card()
 
@@ -958,6 +1081,113 @@ class Distiller:
                 print(f"    {key:45s} ok {mh.generated:4d}  fmt {mh.format_fail:4d}  fail {mh.failed:4d}  {mh.status}")
 
 
+def _mp_child(payload: dict) -> None:
+    roster = yaml.safe_load(Path(payload["roster_path"]).read_text())
+    d = Distiller(
+        roster,
+        Path(payload["out_dir"]),
+        seed=payload["seed"],
+        provider_filter=payload["provider_filter"],
+        model_filter=payload["model_filter"],
+        curriculum_mode=payload["curriculum_mode"],
+        holdout_frac=payload["holdout_frac"],
+        write_eval_card=False,
+        stamp_trace_eval=payload["stamp_trace_eval"],
+        verify_sample=payload["verify_sample"],
+        no_verify=payload["no_verify"],
+        cross_teacher=payload["cross_teacher"],
+        cross_teacher_rate=payload["cross_teacher_rate"],
+        dpo_enabled=payload["dpo_enabled"],
+        dpo_rate=payload["dpo_rate"],
+        shard_i=payload["shard_i"],
+        shard_n=payload["shard_n"],
+    )
+    asyncio.run(d.run(payload["count"], pilot=payload["pilot"]))
+
+
+def run_mp(
+    roster_path: str,
+    out_dir: Path,
+    count: int,
+    nproc: int,
+    seed: int,
+    holdout_frac: float,
+    provider_filter,
+    model_filter,
+    curriculum_mode: str,
+    write_eval_card: bool,
+    stamp_trace_eval: bool,
+    verify_sample: float,
+    no_verify: bool,
+    cross_teacher: bool,
+    cross_teacher_rate: float,
+    dpo_enabled: bool,
+    dpo_rate: float,
+    pilot: bool,
+) -> None:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if files_to_archive(out_dir):
+        print("archive or wipe before --mp")
+        raise SystemExit(1)
+    hold_path = out_dir / "holdout_plan_ids.json"
+    if holdout_frac > 0 and not hold_path.exists():
+        _train, hold = split_plan_ids(PLANS, holdout_frac, seed)
+        _atomic_write_json(hold_path, hold)
+    counts = split_counts(count, nproc)
+    ctx = multiprocessing.get_context("spawn")
+    procs = []
+    for i, child_count in enumerate(counts):
+        if child_count <= 0:
+            continue
+        payload = {
+            "roster_path": str(roster_path),
+            "out_dir": str(out_dir),
+            "count": int(child_count),
+            "seed": int(seed) + i * 7919,
+            "shard_i": i,
+            "shard_n": int(nproc),
+            "holdout_frac": float(holdout_frac),
+            "provider_filter": provider_filter,
+            "model_filter": model_filter,
+            "curriculum_mode": curriculum_mode,
+            "stamp_trace_eval": bool(stamp_trace_eval),
+            "verify_sample": float(verify_sample),
+            "no_verify": bool(no_verify),
+            "cross_teacher": bool(cross_teacher),
+            "cross_teacher_rate": float(cross_teacher_rate),
+            "dpo_enabled": bool(dpo_enabled),
+            "dpo_rate": float(dpo_rate),
+            "pilot": bool(pilot),
+        }
+        p = ctx.Process(target=_mp_child, args=(payload,))
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+    codes = [p.exitcode for p in procs]
+    if any(c not in (0,) for c in codes):
+        raise SystemExit(max((c if isinstance(c, int) and c > 0 else 1) for c in codes))
+    if write_eval_card:
+        files = sorted(out_dir.glob("traces_*.jsonl"))
+        traces = load_traces(files)
+        hold = []
+        if hold_path.exists():
+            hold = json.loads(hold_path.read_text(encoding="utf-8"))
+        card = compute_card(
+            traces,
+            token_usage=merge_token_usage(out_dir),
+            extra={
+                "input_paths": [str(p) for p in files],
+                "holdout_plan_ids": hold,
+            },
+        )
+        dest = out_dir / "eval_card.json"
+        dest.write_text(json.dumps(card, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+        print(f"Wrote eval card {dest} n_traces={card.get('n_traces', 0)}")
+
+
 def _resolve_out_dir(path: str) -> Path:
     p = Path(path)
     if not p.is_absolute():
@@ -978,12 +1208,16 @@ def _pilot_defaults(roster: dict) -> tuple[list[str], list[str]]:
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Reversed-v2 agentic distillation. Teacher writes prose only."
+    )
     ap.add_argument("--count", type=int, default=100, help="total traces to generate")
     ap.add_argument("--pilot", action="store_true",
                     help="print every trace (small run); empty filters use first roster provider/model")
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--roster", default=str(ROSTER_PATH))
+    ap.add_argument("--seed", type=int, default=42,
+                    help="RNG seed; --mp child i uses seed + i * 7919")
+    ap.add_argument("--roster", default=str(ROSTER_PATH),
+                    help="YAML roster path (default: configs/roster.yaml). Keys via key_env only")
     ap.add_argument("--providers", default="",
                     help="comma-separated provider ids to use (default: all, or first roster provider with --pilot)")
     ap.add_argument("--models", default="",
@@ -999,23 +1233,52 @@ def main():
     ap.add_argument("--no-trace-eval", action="store_true",
                     help="omit per-trace eval block (size escape hatch)")
     ap.add_argument("--curriculum", default=None, choices=("off", "uniform", "linear"),
-                    help="plan-tier mix (default: roster curriculum.mode or uniform)")
+                    help="plan-tier mix (default: roster curriculum.mode or uniform); "
+                         "linear interpolates easy 0.50->0.10, medium 0.30->0.20, "
+                         "hard 0.15->0.40, expert 0.05->0.30")
     ap.add_argument("--holdout-frac", type=float, default=None,
-                    help="fraction of plan ids held out of training (default: 0.15)")
+                    help="fraction of plan ids held out of training (default: 0.15); 0 disables holdout")
     ap.add_argument("--verify-sample", type=float, default=None,
                     help="LLM-verify sample rate for already-passing traces (default: 0.2)")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip LLM verifier calls; deterministic repair still runs")
+    ap.add_argument("--cross-teacher", action="store_true",
+                    help="split thoughts/final across two teacher routes")
+    ap.add_argument("--cross-teacher-rate", type=float, default=None,
+                    help="probability of a thoughts/answer split when --cross-teacher (default 0.3)")
+    ap.add_argument("--dpo", action="store_true",
+                    help="write dpo_pairs_{prov}.jsonl next to traces; rejected never in traces_*.jsonl")
+    ap.add_argument("--dpo-rate", type=float, default=None,
+                    help="probability of building a DPO pair per kept trace (default 1.0)")
+    ap.add_argument("--mp", type=int, default=1,
+                    help="POSIX processes sharing out-dir via fcntl; 1 = in-process")
+    ap.add_argument("--shard", default="0/1",
+                    help="i/N (0-indexed) keep when int(traj_hash[:8],16)%%N==i; checked before teacher HTTP")
     args = ap.parse_args()
 
     if args.legacy_v1:
         print("legacy-v1 is frozen; reversed-v2 is the only supported generator")
         raise SystemExit(2)
 
+    mp_n = parse_mp(args.mp)
+    shard_i, shard_n = parse_shard(args.shard)
+    if mp_n > 1 and fcntl is None:
+        print("fcntl missing; use --shard on separate machines")
+        raise SystemExit(2)
+    if mp_n > 1 and args.shard != "0/1":
+        print("do not combine --mp with explicit --shard; --mp implies --shard i/N per child")
+        raise SystemExit(2)
+
     out_dir = _resolve_out_dir(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # SAFETY GUARD: never silently overwrite existing data.
+    # --mp requires an empty run-state dir (traces, checkpoints, dpo, tokens, card, holdout).
+    run_state = files_to_archive(out_dir)
+    if mp_n > 1 and run_state and not args.wipe:
+        print("archive or wipe before --mp")
+        raise SystemExit(1)
+
     existing = list(out_dir.glob("traces_*.jsonl"))
     if existing and not args.wipe:
         print(f"[GUARD] {out_dir} already has {len(existing)} trace file(s).")
@@ -1023,7 +1286,7 @@ def main():
         print("[GUARD] Or pass --wipe to archive existing traces, then proceed.")
         raise SystemExit(1)
 
-    if existing and args.wipe:
+    if args.wipe and files_to_archive(out_dir):
         try:
             archive_raw(
                 raw_dir=out_dir,
@@ -1032,6 +1295,10 @@ def main():
             )
         except Exception as e:
             print(f"[GUARD] archive failed: {e}")
+            raise SystemExit(1)
+        leftover_state = files_to_archive(out_dir)
+        if mp_n > 1 and leftover_state:
+            print("archive or wipe before --mp")
             raise SystemExit(1)
         leftover = list(out_dir.glob("traces_*.jsonl"))
         if leftover:
@@ -1061,15 +1328,48 @@ def main():
     holdout_frac = args.holdout_frac if args.holdout_frac is not None else float(cur_conf.get("holdout_frac", 0.15))
     ver_conf = (roster or {}).get("verify") or {}
     verify_sample = args.verify_sample if args.verify_sample is not None else float(ver_conf.get("sample_rate", 0.2))
-    d = Distiller(roster, out_dir, seed=args.seed,
-                  provider_filter=providers or None,
-                  model_filter=models or None,
-                  curriculum_mode=curriculum_mode,
-                  holdout_frac=holdout_frac,
-                  write_eval_card=not args.no_eval_card,
-                  stamp_trace_eval=not args.no_trace_eval,
-                  verify_sample=verify_sample,
-                  no_verify=args.no_verify)
+    dpo_conf = (roster or {}).get("dpo") or {}
+    dpo_enabled = True if args.dpo else bool(dpo_conf.get("enabled", False))
+    dpo_rate = args.dpo_rate if args.dpo_rate is not None else float(dpo_conf.get("rate", 1.0))
+    cross_teacher_rate = args.cross_teacher_rate if args.cross_teacher_rate is not None else 0.3
+    distiller_kwargs = dict(
+        provider_filter=providers or None,
+        model_filter=models or None,
+        curriculum_mode=curriculum_mode,
+        holdout_frac=holdout_frac,
+        write_eval_card=not args.no_eval_card,
+        stamp_trace_eval=not args.no_trace_eval,
+        verify_sample=verify_sample,
+        no_verify=args.no_verify,
+        cross_teacher=bool(args.cross_teacher),
+        cross_teacher_rate=cross_teacher_rate,
+        dpo_enabled=dpo_enabled,
+        dpo_rate=dpo_rate,
+    )
+    if mp_n > 1:
+        run_mp(
+            roster_path=args.roster,
+            out_dir=out_dir,
+            count=args.count,
+            nproc=mp_n,
+            seed=args.seed,
+            holdout_frac=holdout_frac,
+            provider_filter=providers or None,
+            model_filter=models or None,
+            curriculum_mode=curriculum_mode,
+            write_eval_card=not args.no_eval_card,
+            stamp_trace_eval=not args.no_trace_eval,
+            verify_sample=verify_sample,
+            no_verify=args.no_verify,
+            cross_teacher=bool(args.cross_teacher),
+            cross_teacher_rate=cross_teacher_rate,
+            dpo_enabled=dpo_enabled,
+            dpo_rate=dpo_rate,
+            pilot=args.pilot,
+        )
+        return
+    d = Distiller(roster, out_dir, seed=args.seed, shard_i=shard_i, shard_n=shard_n,
+                  **distiller_kwargs)
     asyncio.run(d.run(args.count, pilot=args.pilot))
 
 

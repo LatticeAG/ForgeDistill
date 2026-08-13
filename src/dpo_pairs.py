@@ -385,12 +385,16 @@ def pairs_from_traces(traces: list[dict], rng: random.Random, dpo_rate: float = 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if "--dpo-rewrite-prose" in raw:
-        print("--dpo-rewrite-prose is out of v0.2", file=sys.stderr)
+        print("--dpo-rewrite-prose is out of v0.2 and v0.3", file=sys.stderr)
         return 2
 
     ap = argparse.ArgumentParser(
-        description="Build DPO pairs from traces_*.jsonl by mutating assembled chosen traces"
+        description=(
+            "Build DPO pairs from traces_*.jsonl by mutating assembled chosen traces. "
+            "Prose rewrite of rejected sides is out of v0.3 (and v0.2)."
+        )
     )
+    ap.add_argument("--dpo-rewrite-prose", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument(
         "--input", action="append", required=True, type=Path,
         help="trace jsonl file, or a directory expanded to traces_*.jsonl only",

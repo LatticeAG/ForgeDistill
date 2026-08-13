@@ -11,9 +11,9 @@ Rules:
 import json, re, collections, random
 from pathlib import Path
 
-RAW = Path("/home/ubuntu/nanbeige-agentic/data/raw")
-OUT = Path("/home/ubuntu/nanbeige-agentic/data/validated")
-OUT.mkdir(parents=True, exist_ok=True)
+ROOT = Path(__file__).resolve().parent.parent
+RAW = ROOT / "data" / "raw"
+OUT = ROOT / "data" / "validated"
 
 THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.S)
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
@@ -67,65 +67,62 @@ def score_trace(t):
     return s
 
 
-# Load all traces
-traces = []
-for p in RAW.glob("traces_*.jsonl"):
-    for line in p.open(encoding="utf-8"):
-        line = line.strip()
-        if line:
-            try:
-                traces.append(json.loads(line))
-            except Exception:
-                pass
+if __name__ == "__main__":
+    OUT.mkdir(parents=True, exist_ok=True)
 
-print(f"Loaded: {len(traces)}")
+    traces = []
+    for p in RAW.glob("traces_*.jsonl"):
+        for line in p.open(encoding="utf-8"):
+            line = line.strip()
+            if line:
+                try:
+                    traces.append(json.loads(line))
+                except Exception:
+                    pass
 
-# Group by prompt, keep best
-by_prompt = collections.defaultdict(list)
-for t in traces:
-    by_prompt[t["prompt"]].append(t)
+    print(f"Loaded: {len(traces)}")
 
-kept = []
-dropped_reasons = collections.Counter()
-for prompt, group in by_prompt.items():
-    scored = [(score_trace(t), t) for t in group]
-    best_score, best = max(scored, key=lambda x: x[0])
-    if best_score < -500:
-        dropped_reasons["malformed_tool_call"] += 1
-        continue
-    kept.append(best)
+    by_prompt = collections.defaultdict(list)
+    for t in traces:
+        by_prompt[t["prompt"]].append(t)
 
-# Filter truncated-only traces
-final = []
-for t in kept:
-    truncs = [m for m in t["messages"] if m["role"] == "assistant" and is_truncated(m)]
-    if truncs and score_trace(t) < 30:
-        dropped_reasons["truncated"] += 1
-        continue
-    final.append(t)
+    kept = []
+    dropped_reasons = collections.Counter()
+    for prompt, group in by_prompt.items():
+        scored = [(score_trace(t), t) for t in group]
+        best_score, best = max(scored, key=lambda x: x[0])
+        if best_score < -500:
+            dropped_reasons["malformed_tool_call"] += 1
+            continue
+        kept.append(best)
 
-# Shuffle deterministically
-random.Random(42).shuffle(final)
+    final = []
+    for t in kept:
+        truncs = [m for m in t["messages"] if m["role"] == "assistant" and is_truncated(m)]
+        if truncs and score_trace(t) < 30:
+            dropped_reasons["truncated"] += 1
+            continue
+        final.append(t)
 
-# Write
-out_file = OUT / "train_clean.jsonl"
-with open(out_file, "w", encoding="utf-8") as f:
-    for t in final:
-        f.write(json.dumps(t, ensure_ascii=False) + "\n")
+    random.Random(42).shuffle(final)
 
-# Report
-classes = collections.Counter(t["seed_class"] for t in final)
-teachers = collections.Counter(t["teacher"] for t in final)
-tool_traces = sum(1 for t in final if any("<tool_call>" in m.get("content", "") for m in t["messages"]))
-thought_traces = sum(1 for t in final if any("<thought>" in m.get("content", "") for m in t["messages"]))
+    out_file = OUT / "train_clean.jsonl"
+    with open(out_file, "w", encoding="utf-8") as f:
+        for t in final:
+            f.write(json.dumps(t, ensure_ascii=False) + "\n")
 
-print(f"\nAfter dedup (best per prompt): {len(kept)}")
-print(f"After truncation filter: {len(final)}")
-print(f"Dropped: {dict(dropped_reasons)}")
-print(f"\nClass distribution: {dict(classes)}")
-print(f"Teacher distribution:")
-for k, v in teachers.most_common():
-    print(f"  {k:45s} {v}")
-print(f"\nTool-call traces: {tool_traces} ({100*tool_traces/len(final):.1f}%)")
-print(f"Thought-block traces: {thought_traces} ({100*thought_traces/len(final):.1f}%)")
-print(f"\nWrote: {out_file}")
+    classes = collections.Counter(t["seed_class"] for t in final)
+    teachers = collections.Counter(t["teacher"] for t in final)
+    tool_traces = sum(1 for t in final if any("<tool_call>" in m.get("content", "") for m in t["messages"]))
+    thought_traces = sum(1 for t in final if any("<thought>" in m.get("content", "") for m in t["messages"]))
+
+    print(f"\nAfter dedup (best per prompt): {len(kept)}")
+    print(f"After truncation filter: {len(final)}")
+    print(f"Dropped: {dict(dropped_reasons)}")
+    print(f"\nClass distribution: {dict(classes)}")
+    print(f"Teacher distribution:")
+    for k, v in teachers.most_common():
+        print(f"  {k:45s} {v}")
+    print(f"\nTool-call traces: {tool_traces} ({100*tool_traces/len(final):.1f}%)")
+    print(f"Thought-block traces: {thought_traces} ({100*thought_traces/len(final):.1f}%)")
+    print(f"\nWrote: {out_file}")

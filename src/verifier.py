@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from prose_writer import _facts_from_step, validate_answer_grounding
+from prose_writer import _facts_from_step, _is_opaque_id, validate_answer_grounding
 
 VerifyKind = Literal["missing_fact", "fabrication", "empty", "other"]
 VerifyVerdict = Literal["pass", "fail"]
@@ -32,6 +32,8 @@ def _substantial_facts(step: dict, limit: int = 4) -> list[str]:
         if fl in ("true", "false"):
             continue
         if len(f) < 2 or fl in seen:
+            continue
+        if _is_opaque_id(f):
             continue
         seen.add(fl)
         out.append(f)

@@ -22,6 +22,7 @@ from mock_tools import EMAIL_BY_USER, USERS
 THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.S)
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+OPAQUE_ID_RE = re.compile(r"\b(?:evt|doc)\.[A-Za-z0-9]+\b")
 NUDGE_TEXT = "Now provide the final answer to the user's original request."
 DISTILL_VERSION = "reversed-v2"
 
@@ -29,11 +30,15 @@ KNOWN_NAMES = {u["name"] for u in USERS.values()}
 KNOWN_EMAILS = set(EMAIL_BY_USER.values())
 
 
+def _is_opaque_id(s: str) -> bool:
+    return bool(OPAQUE_ID_RE.fullmatch((s or "").strip()))
+
+
 def build_prose_prompt(traj: dict) -> str:
     """Build the teacher prompt for one trajectory.
 
     The teacher emits N <thought> blocks and FINAL_ANSWER only.
-    Do NOT ask for <tool_call> — those are injected from the trajectory.
+    Do NOT ask for <tool_call> - those are injected from the trajectory.
     """
     n = len(traj["steps"])
     lines = [
@@ -62,6 +67,9 @@ def build_prose_prompt(traj: dict) -> str:
         "The final answer MUST use REAL values from the tool results above",
         "(exact numbers, names, addresses, counts, conditions). Do not invent values.",
         "If a call failed, say so; do not pretend a substitute succeeded.",
+        "Opaque ids (event_id, doc_id) may be quoted only if they appear in the tool results above. "
+        "Do not invent them. You are not required to recite them. "
+        "Prefer email, title, name, plan, value, error code.",
         "",
         "Format your reply EXACTLY as:",
         "THOUGHTS:",
@@ -141,6 +149,9 @@ def build_answer_prompt(traj: dict, thoughts: list[str]) -> str:
         "The final answer MUST use REAL values from the tool results above",
         "(exact numbers, names, addresses, counts, conditions). Do not invent values.",
         "If a call failed, say so; do not pretend a substitute succeeded.",
+        "Opaque ids (event_id, doc_id) may be quoted only if they appear in the tool results above. "
+        "Do not invent them. You are not required to recite them. "
+        "Prefer email, title, name, plan, value, error code.",
         "",
         "Format your reply EXACTLY as:",
         "FINAL_ANSWER:",
@@ -269,6 +280,10 @@ def validate_answer_grounding(traj: dict, final: str) -> str | None:
         if email.lower() in final_l and email.lower() not in corpus_l:
             return f"ungrounded registry email: {email}"
 
+    for oid in OPAQUE_ID_RE.findall(final):
+        if oid not in corpus:
+            return f"ungrounded opaque id: {oid}"
+
     steps = traj.get("steps") or []
     if not steps:
         return "no steps to ground against"
@@ -293,8 +308,11 @@ def validate_answer_grounding(traj: dict, final: str) -> str | None:
             substantial.append(f)
     if not substantial:
         return None
+    filtered = [f for f in substantial if not _is_opaque_id(f)]
+    if not filtered:
+        return None
     matched = False
-    for f in substantial:
+    for f in filtered:
         fl = f.lower()
         if fl in final_l:
             matched = True
@@ -308,7 +326,7 @@ def validate_answer_grounding(traj: dict, final: str) -> str | None:
             matched = True
             break
     if not matched:
-        return f"final missing key fact from last result (expected one of {substantial[:6]})"
+        return f"final missing key fact from last result (expected one of {filtered[:6]})"
     return None
 
 

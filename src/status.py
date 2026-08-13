@@ -34,7 +34,7 @@ def main(watch: bool = False):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--watch", action="store_true")
+    ap = argparse.ArgumentParser(description="Count traces_*.jsonl lines under data/raw")
+    ap.add_argument("--watch", action="store_true", help="reprint every 10s")
     args = ap.parse_args()
     main(args.watch)

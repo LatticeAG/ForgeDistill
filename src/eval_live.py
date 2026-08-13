@@ -537,13 +537,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="use ReplayStudent (no HTTP); for CI",
     )
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for plan sampling (default 0)",
+    )
     ap.add_argument(
         "--key-env",
         default="",
         help="env var name holding the bearer token; never pass a raw key",
     )
-    ap.add_argument("--max-turns", type=int, default=8)
+    ap.add_argument(
+        "--max-turns",
+        type=int,
+        default=8,
+        help="stop after this many student turns (default 8)",
+    )
     args = ap.parse_args(argv)
 
     if not args.replay and (not args.endpoint or not args.model):

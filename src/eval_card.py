@@ -86,6 +86,35 @@ def load_traces(paths: list[Path]) -> list[dict]:
     return traces
 
 
+def _merge_token_sidecars(out_dir: Path, acc: dict | None = None) -> dict:
+    """Sum .token_usage_*.json under a directory into acc. Zeros if none exist."""
+    merged = acc or {"input": 0, "output": 0, "by_route": {}}
+    merged.setdefault("input", 0)
+    merged.setdefault("output", 0)
+    merged.setdefault("by_route", {})
+    if not out_dir.is_dir():
+        return merged
+    for p in sorted(out_dir.glob(".token_usage_*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        merged["input"] += int(data.get("input", 0) or 0)
+        merged["output"] += int(data.get("output", 0) or 0)
+        by_route = data.get("by_route") or {}
+        if not isinstance(by_route, dict):
+            continue
+        for route, usage in by_route.items():
+            slot = merged["by_route"].setdefault(str(route), {"input": 0, "output": 0})
+            if not isinstance(usage, dict):
+                continue
+            slot["input"] += int(usage.get("input", 0) or 0)
+            slot["output"] += int(usage.get("output", 0) or 0)
+    return merged
+
+
 def _parse_tool_calls(content: str) -> list[dict] | None:
     """Parse <tool_call> JSON to a non-empty list of {name, arguments}."""
     m = TOOL_CALL_RE.search(content or "")
@@ -433,6 +462,7 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
     n_multi = 0
     n_repaired = 0
     n_cross = 0
+    n_fallback = 0
     n_send = 0
     n_send_learned = 0
     hist: Counter = Counter()
@@ -467,6 +497,8 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
             n_repaired += 1
         if _is_cross_teacher(trace):
             n_cross += 1
+        if (trace.get("eval") or {}).get("cross_teacher_fallback"):
+            n_fallback += 1
         tos = _successful_send_tos(steps)
         if tos:
             n_send += 1
@@ -520,6 +552,8 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
             "unique_traj_hash_rate": _frac(len(hashes), n, empty=0.0),
             "send_email_learned_address_rate": _frac(n_send_learned, n_send, empty=1.0),
             "repaired_rate": _frac(n_repaired, n, empty=0.0),
+            "cross_teacher_split_rate": _frac(n_cross, n, empty=0.0),
+            "cross_teacher_fallback_rate": _frac(n_fallback, n, empty=0.0),
         },
         "skills": {
             "counts": dict(skill_counts),
@@ -596,7 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=None, help="write eval_card JSON here")
     ap.add_argument(
         "--require-gates", action="store_true",
-        help="exit 1 unless prose/grounding/chain/fidelity are 1.0 and nudge_leak_rate is 0.0",
+        help="exit 1 unless prose/grounding/chain/fidelity are 1.0 and nudge_leak_rate is 0.0. "
+             "malformed_tool_call_rate is reported in JSON but is not part of the exit predicate",
     )
     args = ap.parse_args(argv)
 
@@ -604,9 +639,24 @@ def main(argv: list[str] | None = None) -> int:
     for p in args.input:
         files.extend(_expand_input(p))
     traces = load_traces(list(args.input))
+    holdout: list = []
+    token_usage = {"input": 0, "output": 0, "by_route": {}}
+    for p in args.input:
+        if not p.is_dir():
+            continue
+        hp = p / "holdout_plan_ids.json"
+        if hp.is_file():
+            try:
+                loaded = json.loads(hp.read_text(encoding="utf-8"))
+            except Exception:
+                loaded = []
+            if isinstance(loaded, list):
+                holdout = loaded
+        token_usage = _merge_token_sidecars(p, token_usage)
     card = compute_card(
         traces,
-        extra={"input_paths": [str(p) for p in files], "holdout_plan_ids": []},
+        token_usage=token_usage,
+        extra={"input_paths": [str(p) for p in files], "holdout_plan_ids": holdout},
     )
 
     text = json.dumps(card, ensure_ascii=False, indent=2) + "\n"
