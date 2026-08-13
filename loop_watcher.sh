@@ -30,8 +30,9 @@ while true; do
           ping "✅ **K3 review done** (Modal-RR / Kimi K3). Verdict written to SPEC-V0.3-K3-REVIEW.md. Next: Grok Ultimate Build."
           ;;
         *"build "*"finished"*)
-          ping "✅ **Grok Ultimate Build done** (${line##*\(}s). Next: independent verification (pytest, imports, plan counts, stress, key scan)."
-          ;;
+            DUR=$(echo "$line" | grep -oE '[0-9]+s' | head -1)
+            ping "✅ **Grok Ultimate Build done** (${DUR:-?}). Next: independent verification (pytest, imports, plan counts, stress, key scan)."
+            ;;
         *"CODE CLOSURE GREEN"*)
           ping "✅ **Code closure GREEN** - all gates pass. Committing, then real 500-trace fleet run + eval card."
           ;;
