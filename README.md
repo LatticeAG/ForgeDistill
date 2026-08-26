@@ -94,7 +94,10 @@ models do it better - both produce structurally-correct data.
 ## Quick Start
 
 ```bash
-# 1. Clone and set up
+# 1a. Quick install from PyPI (published)
+pip install latticeag-forge-distill
+
+# 1b. Or clone + set up for local development
 git clone https://github.com/LatticeAG/ForgeDistill.git
 cd ForgeDistill
 python3 -m venv .venv && source .venv/bin/activate
