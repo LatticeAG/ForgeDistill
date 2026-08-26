@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "forge-distill"
+name = "latticeag-forge-distill"
 version = "0.3.0"
 description = "Correctness-by-construction distillation for agentic tool-calling models"
 readme = "README.md"
