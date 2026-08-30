@@ -28,7 +28,13 @@ def archive_dest(archive_dir: Path, label: str = "") -> Path:
 
 
 def files_to_archive(raw_dir: Path) -> list[Path]:
-    """Traces, checkpoints, eval card, holdout ids. Never returns directories."""
+    """Traces, checkpoints, eval card, holdout ids, lineage, rejects, locks.
+
+    Never returns directories. Lineage/rejects appends reuse Distiller._locked_append
+    with stem-derived locks (.lock_lineage_{prov}, .lock_rejects_{prov}), distinct
+    from the traces lock. Archiving .lock_* is safe only because this list is
+    consulted when no run is active (GUARD exit 1 / --mp precheck).
+    """
     out: list[Path] = []
     if not raw_dir.is_dir():
         return out
@@ -36,6 +42,9 @@ def files_to_archive(raw_dir: Path) -> list[Path]:
     out.extend(sorted(raw_dir.glob("checkpoint_*.json")))
     out.extend(sorted(raw_dir.glob("dpo_pairs_*.jsonl")))
     out.extend(sorted(raw_dir.glob(".token_usage_*.json")))
+    out.extend(sorted(raw_dir.glob("lineage_*.jsonl")))
+    out.extend(sorted(raw_dir.glob("rejects_*.jsonl")))
+    out.extend(sorted(raw_dir.glob(".lock_*")))
     for name in _EXTRA_NAMES:
         p = raw_dir / name
         if p.is_file():

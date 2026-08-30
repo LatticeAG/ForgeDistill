@@ -205,6 +205,20 @@ def test_cli_check_mask_exits_0_on_fixtures(tmp_path: Path):
     assert "trainable_spans=" in audit_text
 
 
+def test_cli_omits_template_uses_packaged_nanbeige(tmp_path: Path):
+    out = tmp_path / "default.jsonl"
+    r = _run([
+        "--input", str(MINI_TRACES),
+        "--out", str(out),
+        "--check-mask",
+    ])
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = _load_jsonl(out)
+    assert rows
+    assert rows[0]["template"] == "nanbeige-chatml-v1"
+    assert out.is_file() and out.stat().st_size > 0
+
+
 def test_export_does_not_ingest_dpo_pairs(tmp_path: Path):
     traces = _fixture_traces()
     (tmp_path / "traces_ok.jsonl").write_text(

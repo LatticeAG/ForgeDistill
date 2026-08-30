@@ -1,0 +1,53 @@
+# ForgeDistill teacher fleet configuration (example - copy to roster.yaml and fill in).
+#
+# The harness drives any number of OpenAI-compatible endpoints in parallel.
+# Each provider needs: base_url, key_env (the environment variable holding the
+# API key), concurrency, and a set of models with mode + weight.
+#
+#   - mode:     "thinking" (reasoning-burner models, needs max_tokens >= 2000)
+#               or "concise" (fast models, max_tokens ~1000)
+#   - weight:   relative sampling weight - higher = more traces from this model
+#   - max_tokens: keep >= 2000 for thinking models (reasoning burns context)
+#   - strict_tool_protocol: set true only if your router enforces OpenAI
+#     tool_call_id pairing on tool messages.
+#
+# Keys are read from environment variables ONLY - never put keys in this file.
+# Example:   export MY_PROVIDER_KEY=sk-your-key-here
+#
+# Extension keys (roles / curriculum / verify / dpo) are documented below as
+# comments only. Do not uncomment them as null top-level keys: the loader would
+# treat unknown maps as provider ids. When you enable them, use the exact
+# shapes shown.
+
+providers:
+  example-provider:
+    base_url: "https://api.example.com/v1"
+    key_env: "EXAMPLE_PROVIDER_KEY"
+    concurrency: 32
+    strict_tool_protocol: false
+    models:
+      example-model-thinking: {mode: thinking, max_tokens: 2000, weight: 2}
+      example-model-concise:  {mode: concise, max_tokens: 1000, weight: 1}
+
+# A local keyless proxy (e.g. a model router on the same machine).
+# Leave key_env unset (or empty) for endpoints that need no auth.
+  local-router:
+    base_url: "http://127.0.0.1:PORT/v1"
+    key_env: ""
+    concurrency: 64
+    strict_tool_protocol: false
+    models:
+      local-model-a: {mode: concise, max_tokens: 1000, weight: 1}
+      local-model-b: {mode: thinking, max_tokens: 2000, weight: 1}
+
+# roles:
+#   verifier: {provider: example-provider, model: example-model-thinking}
+#   answer:   {provider: example-provider, model: example-model-concise}
+# curriculum:
+#   mode: uniform          # off | uniform | linear
+#   holdout_frac: 0.15
+# verify:
+#   sample_rate: 0.2
+# dpo:
+#   enabled: false
+#   rate: 1.0

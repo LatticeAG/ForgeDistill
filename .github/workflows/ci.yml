@@ -8,15 +8,36 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       # requirements.txt is a pin fallback; CI installs from pyproject.toml
       - name: Install
         run: pip install -e ".[dev]"
+      - name: Compile
+        run: python -m compileall -q src tests
       - name: Test
+        run: pytest -q
+      - name: CLI help
         run: |
-          pytest -q
-          distill --help && eval_card --help && export_sft --help
+          distill --help
+          eval_card --help
+          export_sft --help
+          dpo_pairs --help
+          eval_live --help
+          archive_data --help
+          dataset_publish --help
+      - name: Structural gates
+        run: |
+          eval_card --input tests/fixtures --require-gates
+          python -c "from agentic_plans import build_chain, validate_chain; import random; r=random.Random(0); invalid=sum(1 for _ in range(300) if validate_chain(build_chain(r)['steps'])); assert invalid==0, invalid"
+      - name: Packaging
+        run: |
+          python -m build
+          twine check dist/*
+          python -c "import tarfile,glob; t=tarfile.open(glob.glob('dist/*.tar.gz')[0]); n=set(t.getnames()); assert any(x.endswith('dataset_publish.py') for x in n); assert any(x.endswith('forge_assets/templates/nanbeige.json') for x in n)"

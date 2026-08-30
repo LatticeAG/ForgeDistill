@@ -34,7 +34,7 @@ BAD_KEYWORDS = [
 
 def fetch_rows(ds, cfg, split, offset, length=100):
     url = URL.format(ds=ds, cfg=cfg, split=split, off=offset, length=length)
-    req = urllib.request.Request(url, headers={"User-Agent": "hermes-distill/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "latticeag-forge-distill/0.4"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())["rows"]
 

@@ -48,6 +48,33 @@ def test_move_not_copy_and_dest_exists(tmp_path: Path):
     assert list(raw.glob("traces_*.jsonl")) == []
 
 
+def test_lineage_rejects_and_locks_move(tmp_path: Path):
+    raw = tmp_path / "data" / "raw"
+    raw.mkdir(parents=True)
+    lineage = raw / "lineage_x.jsonl"
+    rejects = raw / "rejects_x.jsonl"
+    lock = raw / ".lock_lineage_x"
+    lineage.write_text('{"kept": true}\n', encoding="utf-8")
+    rejects.write_text('{"kept": false}\n', encoding="utf-8")
+    lock.write_text("", encoding="utf-8")
+
+    dest = archive_data.archive_raw(
+        raw_dir=raw,
+        archive_dir=tmp_path / "data" / "archive",
+        label="lineage",
+    )
+    assert not lineage.exists()
+    assert not rejects.exists()
+    assert not lock.exists()
+    assert (dest / "lineage_x.jsonl").is_file()
+    assert (dest / "rejects_x.jsonl").is_file()
+    assert (dest / ".lock_lineage_x").is_file()
+    assert "kept" in (dest / "lineage_x.jsonl").read_text(encoding="utf-8")
+    assert list(raw.glob("lineage_*.jsonl")) == []
+    assert list(raw.glob("rejects_*.jsonl")) == []
+    assert list(raw.glob(".lock_*")) == []
+
+
 def test_nothing_to_archive_still_returns_dest(tmp_path: Path):
     raw = tmp_path / "data" / "raw"
     raw.mkdir(parents=True)

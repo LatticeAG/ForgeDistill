@@ -171,3 +171,46 @@ def test_mp_rejects_holdout_only_dir(tmp_raw: Path):
     ])
     assert r.returncode == 1, r.stdout + r.stderr
     assert "archive or wipe before --mp" in (r.stdout + r.stderr)
+
+
+def test_missing_roster_exits_2(tmp_raw: Path, tmp_path: Path):
+    missing = tmp_path / "no-such-roster.yaml"
+    r = _run([
+        "--count", "0",
+        "--out-dir", str(tmp_raw),
+        "--roster", str(missing),
+    ])
+    assert r.returncode == 2, r.stdout + r.stderr
+    combined = r.stdout + r.stderr
+    assert "roster not found" in combined
+    assert "configs/roster.example.yaml" in combined
+
+
+def test_empty_roster_exits_2(tmp_raw: Path, tmp_path: Path):
+    roster = tmp_path / "reserved-only.yaml"
+    roster.write_text("roles: {}\ncurriculum: {}\nverify: {}\ndpo: {}\nbackoff: {}\n", encoding="utf-8")
+    r = _run([
+        "--count", "0",
+        "--out-dir", str(tmp_raw),
+        "--roster", str(roster),
+        "--holdout-frac", "0",
+    ])
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "No models in roster" in (r.stdout + r.stderr)
+
+
+def test_non_agentic_seed_class_rejects_not_raises(tmp_path: Path):
+    """Synthetic-caller guard: build_chain never sets seed_class on traj.
+    This injects seed_class='irrelevant' to lock the defensive reject.
+    The raise is dead on the reversed-v2 worker path today.
+    """
+    import asyncio
+    roster = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    d = Distiller(roster, tmp_path / "raw")
+    traj = {"seed_class": "irrelevant", "prompt": "x", "steps": []}
+    res = asyncio.run(d.generate_agentic_trace(
+        "example-provider", "example-model-thinking", {"mode": "concise"}, traj=traj,
+    ))
+    assert res["ok"] is False
+    assert res["http"] == "PLAN"
+    assert "frozen" in res["error"]

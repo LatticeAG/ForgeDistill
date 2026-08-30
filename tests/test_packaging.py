@@ -9,15 +9,30 @@ REPO = Path(__file__).resolve().parent.parent
 def test_pyproject_metadata():
     data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
-    assert project["name"] == "forge-distill"
-    assert project["version"] == "0.3.0"
+    assert project["name"] == "latticeag-forge-distill"
+    assert project["version"] == "0.4.0"
     deps = project["dependencies"]
     assert any("httpx" in d for d in deps)
     assert any("PyYAML" in d for d in deps)
     dev = project["optional-dependencies"]["dev"]
     assert any("pytest" in d for d in dev)
     scripts = project["scripts"]
-    assert set(scripts.keys()) == {"distill", "eval_card", "export_sft"}
+    assert set(scripts.keys()) == {
+        "distill",
+        "eval_card",
+        "export_sft",
+        "dpo_pairs",
+        "eval_live",
+        "archive_data",
+        "dataset_publish",
+        "forge-status",
+    }
+    py_modules = data["tool"]["setuptools"]["py-modules"]
+    assert "dataset_publish" in py_modules
+    assert "lineage" in py_modules
+    assert "dedup_filter" not in py_modules
+    assert "harvest_prompts" not in py_modules
+    assert "forge_assets" in data["tool"]["setuptools"]["packages"]
 
 
 def test_no_src_init_py():
@@ -44,3 +59,53 @@ def test_traces_fixture_matches_mini_traces():
     mini = (REPO / "tests" / "fixtures" / "mini_traces.jsonl").read_bytes()
     card = (REPO / "tests" / "fixtures" / "traces_fixture.jsonl").read_bytes()
     assert mini == card
+
+
+def test_pyproject_urls():
+    data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    urls = data["project"]["urls"]
+    assert urls["Homepage"] == "https://github.com/LatticeAG/ForgeDistill"
+    assert urls["Repository"] == "https://github.com/LatticeAG/ForgeDistill"
+    assert urls["Issues"] == "https://github.com/LatticeAG/ForgeDistill/issues"
+
+
+def test_security_md_exists():
+    path = REPO / "SECURITY.md"
+    text = path.read_text(encoding="utf-8")
+    assert path.is_file()
+    assert "key_env" in text
+    assert "GitHub Security Advisories" in text
+
+
+def test_agent_md_exists():
+    path = REPO / "AGENT.md"
+    text = path.read_text(encoding="utf-8")
+    assert path.is_file()
+    assert "len(PLANS)==47" in text
+    assert "sys.path" in text
+
+
+def test_assets_match_configs():
+    pairs = [
+        ("configs/templates/nanbeige.json", "src/forge_assets/templates/nanbeige.json"),
+        ("configs/templates/chatml.json", "src/forge_assets/templates/chatml.json"),
+        ("configs/roster.example.yaml", "src/forge_assets/roster.example.yaml"),
+    ]
+    for a, b in pairs:
+        left = (REPO / a).read_bytes()
+        right = (REPO / b).read_bytes()
+        assert left == right, a
+
+
+def test_forge_assets_importable():
+    from importlib.resources import files
+
+    blob = (files("forge_assets") / "templates" / "nanbeige.json").read_bytes()
+    assert blob == (REPO / "configs" / "templates" / "nanbeige.json").read_bytes()
+
+
+def test_manifest_excludes_operator_loops():
+    text = (REPO / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "prod_loop.sh" not in text
+    assert "loop_watcher.sh" not in text
+

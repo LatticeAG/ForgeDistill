@@ -78,8 +78,14 @@ def test_compute_card_gates_clean_on_mini_traces():
     assert set(card.keys()) == {
         "forge_spec", "distill_version", "created_at", "input_paths", "n_traces",
         "gates", "structure", "skills", "teachers", "holdout_plan_ids", "tokens",
-        "commands",
+        "commands", "observability",
     }
+    obs = card["observability"]
+    assert obs["lineage_spec"] == "1.0"
+    assert obs["n_rejects_files"] == 0
+    assert obs["n_kept"] == card["n_traces"]
+    assert obs["reject_reasons"] == {}
+    assert obs["n_lineage_ids"] == 0
 
 
 def test_reconstruct_steps_without_chain_steps():

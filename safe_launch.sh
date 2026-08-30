@@ -42,11 +42,16 @@ while [ $# -gt 0 ]; do
 done
 
 PY=""
-if [ -x ".venv/bin/python" ]; then PY=".venv/bin/python"
-elif [ -x "/home/ubuntu/.hermes/hermes-agent/venv/bin/python" ]; then PY="/home/ubuntu/.hermes/hermes-agent/venv/bin/python"
+if [ -n "${FORGE_PYTHON:-}" ] && [ -x "$FORGE_PYTHON" ]; then
+  PY="$FORGE_PYTHON"
+elif [ -x ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
 else
-  echo "[safe_launch] ERROR: no python found" >&2
-  exit 1
+  PY="$(command -v python3 || true)"
+  if [ -z "$PY" ]; then
+    echo "[safe_launch] ERROR: no python found" >&2
+    exit 1
+  fi
 fi
 
 RAW="data/raw"

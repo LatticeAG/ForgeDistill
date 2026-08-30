@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from agentic_plans import trajectory_hash
 from eval_card import load_traces
+from forge_assets import template_path
 from prose_writer import NUDGE_TEXT
 
 LABEL_IGNORE = -100
@@ -491,7 +492,12 @@ def main(argv: list[str] | None = None) -> int:
         help="trace jsonl file, or a directory expanded to traces_*.jsonl only",
     )
     ap.add_argument("--out", required=True, type=Path, help="write SFT jsonl here")
-    ap.add_argument("--template", required=True, type=Path, help="template JSON path")
+    ap.add_argument(
+        "--template",
+        default=None,
+        type=Path,
+        help="template JSON path (default: packaged forge_assets nanbeige.json)",
+    )
     ap.add_argument(
         "--format",
         dest="fmt",
@@ -511,7 +517,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n-check", type=int, default=8, help="examples to tokenize (default 8)")
     args = ap.parse_args(argv)
 
-    template = load_template(args.template)
+    tmpl_path = args.template if args.template is not None else template_path("nanbeige.json")
+    if args.template is not None and not Path(args.template).is_file():
+        print(f"template not found: {args.template}", file=sys.stderr)
+        return 2
+    template = load_template(tmpl_path)
     do_tok = bool(args.check_tokenizer or args.tokenizer)
     tok = None
     if do_tok:

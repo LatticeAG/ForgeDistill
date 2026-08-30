@@ -23,7 +23,7 @@
 
 <p align="center">
   <b>Correctness-by-construction distillation for agentic tool-calling models.</b><br/>
-  The tool-call chains are guaranteed correct before a single teacher token is spent.
+  Distillation Studio first slice: run lineage ledger + packaged CLI, not a hosted trainer.
 </p>
 
 <p align="center">
@@ -64,6 +64,8 @@ Built by [LatticeAG](https://github.com/LatticeAG).
 
 Result: structurally-perfect, prose-grounded training traces from *any* OpenAI-compatible teacher endpoint.
 
+Distillation Studio this cycle is CLI-first lineage plus packaged console scripts, not a hosted trainer and not Unsloth.
+
 ## How It Works
 
 ```mermaid
@@ -94,37 +96,34 @@ models do it better - both produce structurally-correct data.
 ## Quick Start
 
 ```bash
-# 1a. Quick install from PyPI (published)
-pip install latticeag-forge-distill
-
-# 1b. Or clone + set up for local development
+# 1. Clone + editable install (verified path; this is what CI runs)
 git clone https://github.com/LatticeAG/ForgeDistill.git
 cd ForgeDistill
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-# 2. Configure your multi-provider OpenAI-compatible roster (any OpenAI-compatible endpoints)
+# 2. When this version is on PyPI (operator upload; not claimed from this tree)
+pip install latticeag-forge-distill
+
+# 3. Configure your multi-provider OpenAI-compatible roster
 cp configs/roster.example.yaml configs/roster.yaml
 #    - set base_url / key_env per provider
 #    - export your keys, e.g. export MY_PROVIDER_KEY=sk-...
 
-# 3. Sanity check the modules (no sys.path hacks after install)
+# 4. Sanity check the modules (no sys.path hacks after install)
 python -c "import distill_tools, agentic_plans, prose_writer; print('OK')"
 
-# 4. Pilot run (10 traces)
+# 5. Pilot run (10 traces)
 ulimit -n 65536
-python src/distill_tools.py --count 10 --pilot
-# or the installed console script:
 distill --count 10 --pilot
 
-# 5. Audit the output on disk (don't trust stdout)
+# 6. Audit the output on disk (don't trust stdout)
 cat data/raw/traces_*.jsonl | python -m json.tool --json-lines | head -20
 ```
 
-After `pip install -e ".[dev]"`, both forms work: `python src/X.py` for direct scripts and console entry points `distill`, `eval_card`, and `export_sft` for documented commands.
+After `pip install -e ".[dev]"`, console scripts on PATH: `distill`, `eval_card`, `export_sft`, `dpo_pairs`, `eval_live`, `archive_data`, `dataset_publish`, `forge-status`. Direct `python src/X.py` still works.
 
-Generated traces land in `data/raw/traces_<provider>.jsonl`. The harness refuses to overwrite existing data -
-use `src/archive_data.py` to archive runs (it never deletes).
+Trace jsonl is append-guarded: the harness refuses to run over existing traces unless `--wipe` (which archives via `archive_data`, never unlinks). Derived `--out` paths (`eval_card.json`, `export_sft`, `dataset_publish` bundle files) replace on re-run.
 
 ## Dataset Format
 
@@ -172,20 +171,22 @@ Reversed-v2 format - each JSONL line:
 
 ## Verification
 
-CI runs `pytest -q` on Python 3.11.
+CI (`.github/workflows/ci.yml`) runs on Python 3.11 and 3.12: `compileall`, `pytest -q`, CLI `--help` smoke, `eval_card --input tests/fixtures --require-gates`, 300-chain invalid count == 0, `python -m build` + `twine check`.
 
-300-chain stress test (also stored as `eval_card.json` `commands.stress_300`):
+300-chain stress test (after editable install; printed number is the **invalid** count, want 0):
 
 ```bash
-python -c "import sys,random; sys.path.insert(0,'src'); from agentic_plans import build_chain, validate_chain; r=random.Random(0); print(sum(1 for _ in range(300) if validate_chain(build_chain(r)['steps'])))"
+python -c "from agentic_plans import build_chain, validate_chain; import random; r=random.Random(0); print(sum(1 for _ in range(300) if validate_chain(build_chain(r)['steps'])))"
 ```
 
 ### Dataset (structural) audit
 
-Latest measured run: **500 traces**, multi-provider teacher fleet, `reversed-v2`.
+#### Operator-measured (not in this git tree)
+
+Latest operator run: **500 traces**, multi-provider teacher fleet, `reversed-v2`. Source file `data/raw/eval_card.json` is gitignored; a clone cannot reproduce these cells without a live teacher run.
 
 ```bash
-python src/eval_card.py --input data/raw --out data/raw/eval_card.json --require-gates
+eval_card --input data/raw --out data/raw/eval_card.json --require-gates
 ```
 
 | Metric | Source path | Value |
@@ -211,9 +212,22 @@ python src/eval_card.py --input data/raw --out data/raw/eval_card.json --require
 | Hard tier plans | `skills.tier_counts.hard` | 21 |
 | Expert tier plans | `skills.tier_counts.expert` | 5 |
 
-`--require-gates` exits 0 on this run: prose, grounding, chain, and dependency
-fidelity are all 1.0 with zero nudge leaks. Every number above is copied from
-`data/raw/eval_card.json` - the file, not a hand-typed claim.
+`--require-gates` exits 0 on that operator run. Numbers were copied from an operator-local `data/raw/eval_card.json`.
+
+#### CI-measured (in this git tree)
+
+```bash
+eval_card --input tests/fixtures --require-gates
+```
+
+`tests/fixtures/mini_traces.jsonl` and `tests/fixtures/traces_fixture.jsonl` are byte-identical. CI globs `traces_*.jsonl` under that directory.
+
+| Metric | Source | Value |
+|---|---|---|
+| Trace count | `n_traces` | **3** |
+| Prose / grounding / chain / fidelity | `gates.*_pass` | **1.0** |
+| Nudge leak / malformed tool-call | `gates.*_rate` | **0.0** |
+| `observability.n_rejects_files` | fixture dir has no reject sidecars | **0** |
 
 Historical note (2026-08-13, v0.1 pilot, n=10): 10/10 passed format + grounding gates; 100% multi-round; 0 malformed tool calls; 0 unique-prompt collisions; all send_email calls used in-context learned emails.
 
@@ -232,20 +246,21 @@ python -c "from agentic_plans import PLANS, SKILLS; print(len(PLANS), len(SKILLS
 | multi_turn | no student checkpoint in this tag | same as above |
 | irrelevance | unscored | same as above |
 
-CI uses `eval_live.py --replay` (ReplayStudent) separately; those scores are not student-checkpoint rows in this table.
+CI uses `eval_live --replay` (ReplayStudent) separately; those scores are not student-checkpoint rows in this table. ReplayStudent fixture score: `tests/test_eval_live.py::test_replay_student_scores_one_on_ten_built_chains`.
 
 ## Export quickstart
 
 ```bash
-python src/export_sft.py \
+export_sft \
   --input data/raw \
   --out data/export/nanbeige.jsonl \
-  --template configs/templates/nanbeige.json \
   --format messages \
   --check-mask
 ```
 
-`configs/templates/nanbeige.json` and `configs/templates/chatml.json` set `assistant` `loss: true` and all other roles `loss: false`. `--check-mask` validates message-level assistant-only spans. Token-level `--check-tokenizer` is pending a published `NANBEIGE_TOKENIZER` checkpoint and an optional `transformers` install (not a default dependency); do not claim tokenizer verification until that env is set. The command above writes `data/export/nanbeige.jsonl`; `data/export/mask_audit.txt` records the first 3 `traj_hash` values and per-example trainable-span counts from that run. Do not type span counts by hand.
+`--template` is optional; the default is packaged `forge_assets/templates/nanbeige.json`. Pass `--template configs/templates/nanbeige.json` (or `chatml.json`) to override. Clone-path JSON and packaged JSON are byte-identical.
+
+`configs/templates/nanbeige.json` and `configs/templates/chatml.json` set `assistant` `loss: true` and all other roles `loss: false`. `--check-mask` validates message-level assistant-only spans. Token-level `--check-tokenizer` is pending a published `NANBEIGE_TOKENIZER` checkpoint and an optional `transformers` install (not a default dependency); do not claim tokenizer verification until that env is set. `--out` replaces the destination file. The command above writes `data/export/nanbeige.jsonl`; `data/export/mask_audit.txt` records the first 3 `traj_hash` values and per-example trainable-span counts from that run. Do not type span counts by hand.
 
 ## Curriculum
 
@@ -270,38 +285,68 @@ Coverage note from `eval_card.COVERAGE_NOTE`: skills.coverage is computed agains
 | Resilience | Per-provider health state machine (healthy / backoff / quarantined), 429 quarantine, Retry-After honoring, exponential backoff with jitter |
 | Fleet management | Per-provider semaphores, concurrency scaling, weighted model sampling, dead-route re-probing |
 | Robustness | Trajectory-hash dedup, checkpoint/resume per provider, per-worker RNG, token accounting |
-| Safety | Never overwrites existing data; archive-before-run; refuses `--wipe` unless explicit |
+| Safety | Traces append-guarded; `--wipe` archives; derived `--out` paths replace |
 | Curriculum | `--curriculum {off,uniform,linear}` tier mixing |
 | Export | `export_sft.py` renders SFT jsonl with assistant-only loss masks |
 | DPO | `dpo_pairs.py` offline preference pairs from assembled traces |
 | Eval card | `eval_card.py --require-gates` structural audit json |
 | Live hook | `eval_live.py` Forge Live Tool Eval (ReplayStudent in CI) |
+| Lineage | `lineage.py` writes `lineage_{prov}.jsonl` (kept) and `rejects_{prov}.jsonl` (dropped); `eval_card.observability` |
+| Studio CLI | Eight console scripts after install (see Quick Start) |
+| Public bundle | `dataset_publish` scrubs traces, DPO pairs, and lineage for HuggingFace |
+
+## Lineage
+
+Each kept trace gets an additive `lineage_id` (also on the sidecar row). Sidecars:
+
+- `data/raw/lineage_{provider}.jsonl` - kept records (`lineage_spec` 1.0): plan id, teacher route, tokens for that trace, eval copy, optional `dpo_pair_id`. No `messages`, no `chain_steps`, no API keys.
+- `data/raw/rejects_{provider}.jsonl` - one row per dropped attempt (`attempt_seq` + `ts` so retries do not collide).
+
+`eval_card` loads those globs when `--input` is a directory and adds `observability` (`n_kept`, `n_rejects_files`, `reject_reasons`, `tokens_per_kept_trace`, `n_lineage_ids`). `dataset_publish` writes `lineage/train.jsonl` with teacher fields stripped.
 
 ## Repository Layout
 
 ```
-src/agentic_plans.py     Phase 1: deterministic chain builder + plan templates + mock executor
-src/prose_writer.py      Phase 2: teacher prose contract + format/grounding validators + trace assembly
+src/agentic_plans.py     Phase 1: deterministic chain builder + plan templates
+src/prose_writer.py      Phase 2: teacher prose contract + format/grounding validators
 src/distill_tools.py     Async worker loop: fleet health, semaphores, checkpointing, CLI
 src/mock_tools.py        Shared deterministic tool executor (11 tools)
 src/archive_data.py      Archive data/raw to data/archive/<timestamp>_<label>/ - never deletes
-src/eval_card.py         Structural eval card json from traces_*.jsonl
+src/eval_card.py         Structural eval card json from traces_*.jsonl (+ observability)
 src/export_sft.py        SFT export with template-driven loss masks
 src/eval_live.py         Forge Live Tool Eval student hook
 src/verifier.py          Optional LLM verifier for prose repair
 src/curriculum.py        Tier mix, holdout split, plan picking
 src/dpo_pairs.py         Offline DPO pair builder
-configs/templates/*.json Chat templates (nanbeige, chatml)
+src/dataset_publish.py   Public-safe HuggingFace bundle scrubber
+src/lineage.py           Run lineage ledger helpers (kept/reject/summarize)
+src/status.py            forge-status: count traces_*.jsonl
+src/seed_bank.py         Frozen legacy-v1 seeds (packaged, generator not called)
+src/harvest_prompts.py   Unpackaged legacy HF harvest (operator-only)
+src/dedup_filter.py      Unpackaged legacy prompt filter
+src/forge_assets/        Installed template pack + roster.example.yaml
+configs/templates/*.json Chat templates (nanbeige, chatml); byte-match forge_assets
 configs/roster.example.yaml  Teacher fleet config template (copy to roster.yaml)
 tests/                   pytest suite
-.github/workflows/ci.yml CI: editable install, pytest, CLI --help smoke
-pyproject.toml           Package metadata and console scripts
-safe_launch.sh           Archive-first launcher with raised fd limit
+.github/workflows/ci.yml CI: 3.11+3.12, pytest, gates, build/twine
+pyproject.toml           Package metadata and console scripts (0.4.0)
+safe_launch.sh           Archive-first launcher (FORGE_PYTHON / .venv / python3)
+SECURITY.md              Vulnerability reporting; keys env-only
+AGENT.md                 Contributor conventions
+LICENSE                  MIT
 ```
+
+`harvest_prompts.py` and `dedup_filter.py` are unpackaged legacy (excluded from py-modules). `forge_assets` is the wheel template pack.
 
 ## Publishing
 
-Export `HF_TOKEN` for the commands below; do not rely on a cached `huggingface-cli login`; if unset at tag time the upload is a later operator step.
+Scrub internal fields before a public upload:
+
+```bash
+dataset_publish --input data/raw --out /tmp/hf-bundle --check
+```
+
+That writes `sft/train.jsonl`, `dpo/train.jsonl`, and `lineage/train.jsonl` without teacher identities. Export `HF_TOKEN` for the commands below; do not rely on a cached `huggingface-cli login`; if unset at tag time the upload is a later operator step.
 
 ```bash
 huggingface-cli upload LatticeAG/ForgeDistill-agentic data/raw/eval_card.json --repo-type dataset
@@ -317,7 +362,7 @@ huggingface-cli upload LatticeAG/ForgeDistill-agentic data/raw/holdout_plan_ids.
 
 Configure teachers via a multi-provider OpenAI-compatible roster (`configs/roster.yaml`); keys live in env vars only.
 
-## Locked design decisions (v0.3)
+## Locked design decisions (v0.3, still in 0.4.0)
 
 **search.query.** Intersection over whitespace tokens; hit order is `DOC_BY_QUERY[tokens[0]]`; empty and unknown tokens behave as implemented. Do not change this semantics.
 

@@ -36,7 +36,8 @@ from agentic_plans import PLANS, build_chain, validate_chain, trajectory_hash
 from archive_data import archive_raw, default_archive_dir, files_to_archive
 from curriculum import pick_plan_index, split_plan_ids
 from dpo_pairs import build_pair
-from eval_card import compute_card, load_traces, stamp_eval
+from eval_card import compute_card, load_traces, stamp_eval, _load_jsonl_glob
+from lineage import kept_record, lineage_id, map_reject_reason, reject_record
 from verifier import deterministic_repair, should_llm_verify, build_verify_prompt, parse_verify_reply
 from prose_writer import (
     build_prose_prompt, build_answer_prompt, parse_teacher_output,
@@ -72,6 +73,13 @@ def shard_keeps(traj_hash: str, shard_i: int, shard_n: int) -> bool:
     if shard_n <= 1:
         return True
     return int(str(traj_hash)[:8], 16) % shard_n == shard_i
+
+
+def _fold_usage(acc: dict, res: dict | None) -> None:
+    """Add one call's usage into acc. Missing usage counts as 0, never interpolated."""
+    u = (res or {}).get("usage") or {}
+    acc["input"] += int(u.get("input") or 0)
+    acc["output"] += int(u.get("output") or 0)
 
 
 def parse_shard(s: str) -> tuple[int, int]:
@@ -439,6 +447,14 @@ class Distiller:
         path = self.out_dir / f"dpo_pairs_{prov}.jsonl"
         self._locked_append(path, json.dumps(pair, ensure_ascii=False))
 
+    def _append_lineage(self, prov: str, row: dict) -> None:
+        path = self.out_dir / f"lineage_{prov}.jsonl"
+        self._locked_append(path, json.dumps(row, ensure_ascii=False))
+
+    def _append_reject(self, prov: str, row: dict) -> None:
+        path = self.out_dir / f"rejects_{prov}.jsonl"
+        self._locked_append(path, json.dumps(row, ensure_ascii=False))
+
     # ---- trace generation ----------------------------------------------
     def _system_prompt(self, cls: str) -> str:
         schemas = json.dumps(TOOL_DEFINITIONS)
@@ -521,13 +537,16 @@ class Distiller:
                 d = r.json()
                 msg = (d.get("choices") or [{}])[0].get("message") or {}
                 usage = d.get("usage") or {}
-                # Track tokens per model
+                parsed_usage = {
+                    "input": int(usage.get("prompt_tokens") or 0),
+                    "output": int(usage.get("completion_tokens") or 0),
+                }
                 key = f"{prov}/{model}"
                 u = self.token_usage.setdefault(key, {"input": 0, "output": 0})
-                u["input"] += usage.get("prompt_tokens", 0) or 0
-                u["output"] += usage.get("completion_tokens", 0) or 0
+                u["input"] += parsed_usage["input"]
+                u["output"] += parsed_usage["output"]
                 return {"ok": True, "content": msg.get("content") or "", "reasoning": msg.get("reasoning_content") or "",
-                        "usage": usage}
+                        "usage": parsed_usage}
             except Exception as e:
                 return {"ok": False, "error": f"parse: {e}"}
         retry_after = r.headers.get("retry-after")
@@ -733,20 +752,24 @@ class Distiller:
         if traj is None:
             traj = build_chain(rng or self.rng, exclude_ids=self.holdout_ids)
         if traj.get("seed_class") not in (None, "agentic"):
-            raise NotImplementedError("non-agentic seed_class is a future extension")
+            return {"ok": False, "error": "non-agentic seed_class is frozen; reversed-v2 is agentic-only",
+                    "http": "PLAN", "usage": {"input": 0, "output": 0}}
         plan_err = validate_chain(traj["steps"])
         if plan_err:
-            return {"ok": False, "error": f"plan: {plan_err}", "http": "PLAN"}
+            return {"ok": False, "error": f"plan: {plan_err}", "http": "PLAN",
+                    "usage": {"input": 0, "output": 0}}
 
         teacher_prompt = build_prose_prompt(traj)
         sys_prompt = self._system_prompt("agentic")
         rng = rng or self.rng
         n_steps = len(traj["steps"])
+        usage_acc = {"input": 0, "output": 0}
 
         r1 = await self._chat_user(prov, model, model_conf, teacher_prompt)
+        _fold_usage(usage_acc, r1)
         if not r1["ok"]:
             return {"ok": False, "error": r1.get("error"), "http": r1.get("http"),
-                    "retry_after": r1.get("retry_after")}
+                    "retry_after": r1.get("retry_after"), "usage": dict(usage_acc)}
 
         blob = r1.get("content") or ""
         if r1.get("reasoning"):
@@ -756,7 +779,8 @@ class Distiller:
 
         thoughts = parse_thoughts(blob, n_steps) or parse_thoughts(blob_plus, n_steps)
         if not thoughts:
-            return {"ok": False, "error": "could not parse teacher prose", "http": "FORMAT"}
+            return {"ok": False, "error": "could not parse teacher prose", "http": "FORMAT",
+                    "usage": dict(usage_acc)}
 
         split = False
         fallback = False
@@ -777,12 +801,14 @@ class Distiller:
             ans_prov, ans_model, ans_conf = answer_route
             ans_prompt = build_answer_prompt(traj, thoughts)
             r2 = await self._chat_user(ans_prov, ans_model, ans_conf, ans_prompt)
+            _fold_usage(usage_acc, r2)
             if r2.get("ok"):
                 final = parse_final(r2.get("content") or "")
             if not final:
                 self.cross_teacher_fallback += 1
                 fallback = True
                 r_fb = await self._chat_user(prov, model, model_conf, ans_prompt)
+                _fold_usage(usage_acc, r_fb)
                 if r_fb.get("ok"):
                     final = parse_final(r_fb.get("content") or "")
                 if not final:
@@ -794,7 +820,11 @@ class Distiller:
                 final = parsed_one["final"]
 
         if not thoughts or not final:
-            return {"ok": False, "error": "could not parse teacher prose", "http": "FORMAT"}
+            fail = {"ok": False, "error": "could not parse teacher prose", "http": "FORMAT",
+                    "usage": dict(usage_acc)}
+            if split and answer_route:
+                fail["teacher"] = f"{ans_prov}/{ans_model}"
+            return fail
         parsed = {"thoughts": thoughts, "final": final}
 
         gerr = validate_answer_grounding(traj, parsed["final"])
@@ -806,7 +836,8 @@ class Distiller:
                 repaired = True
                 gerr = None
         if gerr:
-            return {"ok": False, "error": f"grounding: {gerr}", "http": "GROUNDING"}
+            return {"ok": False, "error": f"grounding: {gerr}", "http": "GROUNDING",
+                    "usage": dict(usage_acc)}
 
         trace, aerr = assemble_trace(
             traj,
@@ -814,17 +845,21 @@ class Distiller:
             parsed, sys_prompt,
         )
         if aerr or trace is None:
-            return {"ok": False, "error": f"assemble: {aerr}", "http": "FORMAT"}
+            return {"ok": False, "error": f"assemble: {aerr}", "http": "FORMAT",
+                    "usage": dict(usage_acc)}
         trace["traj_hash"] = trajectory_hash(traj)
         trace["forge_spec"] = "0.2"
         if traj.get("tier") and not trace.get("plan_tier"):
             trace["plan_tier"] = traj["tier"]
         verr = validate_prose_trace(trace)
         if verr:
-            return {"ok": False, "error": f"prose validate: {verr}", "http": "FORMAT"}
-        vfail = await self._maybe_llm_verify(traj, parsed["final"], repaired, rng or self.rng)
+            return {"ok": False, "error": f"prose validate: {verr}", "http": "FORMAT",
+                    "usage": dict(usage_acc)}
+        vfail = await self._maybe_llm_verify(
+            traj, parsed["final"], repaired, rng or self.rng, usage_acc=usage_acc,
+        )
         if vfail:
-            return {"ok": False, "error": vfail, "http": "VERIFY"}
+            return {"ok": False, "error": vfail, "http": "VERIFY", "usage": dict(usage_acc)}
         if self.stamp_trace_eval:
             if split and answer_route and not fallback:
                 trace["teacher_thoughts"] = f"{prov}/{model}"
@@ -835,10 +870,11 @@ class Distiller:
                            cross_teacher_fallback=True)
             else:
                 stamp_eval(trace, traj, repaired=repaired, cross_teacher=False)
-        return {"ok": True, "trace": trace, "tool_calls_made": n_steps, "repaired": repaired}
+        return {"ok": True, "trace": trace, "tool_calls_made": n_steps, "repaired": repaired,
+                "usage": dict(usage_acc)}
 
     async def _maybe_llm_verify(self, traj: dict, final: str, repaired: bool,
-                                rng: random.Random) -> str | None:
+                                rng: random.Random, usage_acc: dict | None = None) -> str | None:
         """Optional PASS/FAIL gate. HTTP/parse failure: skip and keep the trace."""
         if self.no_verify:
             return None
@@ -864,6 +900,8 @@ class Distiller:
         except Exception:
             self.verify_skipped += 1
             return None
+        if usage_acc is not None:
+            _fold_usage(usage_acc, r)
         if not r.get("ok"):
             self.verify_skipped += 1
             return None
@@ -892,8 +930,8 @@ class Distiller:
     async def run(self, count: int, pilot: bool = False):
         worklist = self._providers_with_models()
         if not worklist:
-            print("No models in roster!")
-            return
+            print("No models in roster!", file=sys.stderr)
+            raise SystemExit(2)
         print(f"Roster: {len(worklist)} model routes across {len({p for p,_,_ in worklist})} providers")
         print("Routes: " + ", ".join(f"{p}/{m}" for p, m, _ in worklist))
         print(f"Distill version: {DISTILL_VERSION}")
@@ -908,6 +946,7 @@ class Distiller:
             nonlocal produced
             rng = random.Random((self.seed + worker_id * 1_000_003) & 0xFFFFFFFF)
             route = f"{prov}/{model}"
+            attempt_seq = 0
             while True:
                 async with lock:
                     if produced >= count:
@@ -952,13 +991,23 @@ class Distiller:
                     produced += 1
                     my_slot = produced
                 async with self.semaphores[prov]:
+                    attempt_seq += 1
                     res = await self.generate_agentic_trace(prov, model, mconf, traj=traj, rng=rng)
+                usage = res.get("usage") or {"input": 0, "output": 0}
                 if res.get("ok"):
                     pair = None
                     if self.dpo_enabled and rng.random() < self.dpo_rate:
                         pair = build_pair(res["trace"], traj, rng)
                         if pair:
                             res["trace"]["dpo_pair_id"] = pair["pair_id"]
+                    teacher = str(res["trace"].get("teacher") or route)
+                    lid = lineage_id(
+                        str(res["trace"].get("traj_hash") or thash or ""),
+                        teacher,
+                        str(res["trace"].get("distill_version") or DISTILL_VERSION),
+                        str(res["trace"].get("forge_spec") or "0.2"),
+                    )
+                    res["trace"]["lineage_id"] = lid
                     wrote = self._append_trace(prov, res["trace"])
                     if not wrote:
                         mh.note_format_fail()
@@ -966,8 +1015,26 @@ class Distiller:
                             produced -= 1
                             if thash:
                                 self.used_trajs.discard(thash)
-                        print(f"  [REJ] {route} rejected by validator: {res['trace'].get('seed_class')}")
+                        gate_err = validate_prose_trace(res["trace"]) or "append rejected"
+                        print(f"  [REJ] {route} rejected by validator: {gate_err}")
+                        self._append_reject(prov, reject_record(
+                            prov=prov,
+                            model=model,
+                            plan_id=traj.get("plan_id") if traj else None,
+                            traj_hash=thash,
+                            reason=map_reject_reason(res, gate_err=gate_err),
+                            http=res.get("http"),
+                            error=str(gate_err),
+                            attempt_seq=attempt_seq,
+                        ))
                     else:
+                        self._append_lineage(prov, kept_record(
+                            res["trace"],
+                            tokens_in=int(usage.get("input") or 0),
+                            tokens_out=int(usage.get("output") or 0),
+                            curriculum_mode=self.curriculum_mode,
+                            seed=self.seed,
+                        ))
                         if pair is not None:
                             self._append_dpo(prov, pair)
                         h.note_success()
@@ -987,6 +1054,20 @@ class Distiller:
                         produced -= 1
                         if thash:
                             self.used_trajs.discard(thash)
+                    rej_prov, rej_model = prov, model
+                    attempted = res.get("teacher")
+                    if isinstance(attempted, str) and "/" in attempted:
+                        rej_prov, rej_model = attempted.split("/", 1)
+                    self._append_reject(rej_prov, reject_record(
+                        prov=rej_prov,
+                        model=rej_model,
+                        plan_id=traj.get("plan_id") if traj else None,
+                        traj_hash=thash,
+                        reason=map_reject_reason(res),
+                        http=http,
+                        error=str(res.get("error") or ""),
+                        attempt_seq=attempt_seq,
+                    ))
                     if h.status == "quarantined":
                         print(f"  [Q] {route} provider quarantined after {h.consecutive_failures} failures: {res.get('error','')[:100]}")
                     else:
@@ -1040,6 +1121,8 @@ class Distiller:
             extra={
                 "input_paths": [str(p) for p in files],
                 "holdout_plan_ids": hold,
+                "lineage_rows": _load_jsonl_glob(self.out_dir, "lineage_*.jsonl"),
+                "reject_rows": _load_jsonl_glob(self.out_dir, "rejects_*.jsonl"),
             },
         )
         out = self.out_dir / "eval_card.json"
@@ -1180,6 +1263,8 @@ def run_mp(
             extra={
                 "input_paths": [str(p) for p in files],
                 "holdout_plan_ids": hold,
+                "lineage_rows": _load_jsonl_glob(out_dir, "lineage_*.jsonl"),
+                "reject_rows": _load_jsonl_glob(out_dir, "rejects_*.jsonl"),
             },
         )
         dest = out_dir / "eval_card.json"
@@ -1305,7 +1390,19 @@ def main():
             print(f"[GUARD] archive left {len(leftover)} trace file(s) in place; refusing to continue.")
             raise SystemExit(1)
 
-    roster = yaml.safe_load(Path(args.roster).read_text())
+    try:
+        roster = yaml.safe_load(Path(args.roster).read_text())
+    except FileNotFoundError:
+        print(
+            f"roster not found: {args.roster} "
+            "(copy configs/roster.example.yaml to configs/roster.yaml, "
+            "or --roster pointing at packaged forge_assets/roster.example.yaml)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    except yaml.YAMLError as e:
+        print(f"roster YAML invalid: {e}", file=sys.stderr)
+        raise SystemExit(2)
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     if args.pilot and not providers:

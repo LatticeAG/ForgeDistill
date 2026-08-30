@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from agentic_plans import PLANS, SKILLS, trajectory_hash, validate_chain
+from lineage import summarize
 from mock_tools import EMAIL_BY_USER, execute_one
 from prose_writer import (
     DISTILL_VERSION,
@@ -451,6 +452,33 @@ def _is_cross_teacher(trace: dict) -> bool:
     return th is not None and ta is not None and th != ta
 
 
+def _load_jsonl_glob(directory: Path, pattern: str) -> list[dict]:
+    rows: list[dict] = []
+    if not directory.is_dir():
+        return rows
+    for p in sorted(directory.glob(pattern)):
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rows.append(json.loads(line))
+        except Exception:
+            continue
+    return rows
+
+
+def _observability(n: int, token_usage: dict, lineage_rows: list, reject_rows: list) -> dict:
+    obs = summarize(list(lineage_rows or []), list(reject_rows or []), token_usage)
+    obs["n_kept"] = n
+    inp = int(token_usage.get("input") or 0)
+    outp = int(token_usage.get("output") or 0)
+    obs["tokens_per_kept_trace"] = {
+        "input": (inp / n) if n else 0,
+        "output": (outp / n) if n else 0,
+    }
+    return obs
+
+
 def compute_card(traces, token_usage=None, extra=None) -> dict:
     extra = extra or {}
     token_usage = token_usage or {}
@@ -579,6 +607,12 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
             "eval_card": CMD_EVAL_CARD,
             "stress_300": CMD_STRESS_300,
         },
+        "observability": _observability(
+            n,
+            token_usage,
+            extra.get("lineage_rows") or [],
+            extra.get("reject_rows") or [],
+        ),
     }
 
 
@@ -653,10 +687,21 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(loaded, list):
                 holdout = loaded
         token_usage = _merge_token_sidecars(p, token_usage)
+    lineage_rows: list[dict] = []
+    reject_rows: list[dict] = []
+    for p in args.input:
+        if p.is_dir():
+            lineage_rows.extend(_load_jsonl_glob(p, "lineage_*.jsonl"))
+            reject_rows.extend(_load_jsonl_glob(p, "rejects_*.jsonl"))
     card = compute_card(
         traces,
         token_usage=token_usage,
-        extra={"input_paths": [str(p) for p in files], "holdout_plan_ids": holdout},
+        extra={
+            "input_paths": [str(p) for p in files],
+            "holdout_plan_ids": holdout,
+            "lineage_rows": lineage_rows,
+            "reject_rows": reject_rows,
+        },
     )
 
     text = json.dumps(card, ensure_ascii=False, indent=2) + "\n"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "latticeag-forge-distill"
-version = "0.3.0"
+version = "0.4.0"
 description = "Correctness-by-construction distillation for agentic tool-calling models"
 readme = "README.md"
 license = {text = "MIT"}
@@ -15,33 +15,56 @@ dependencies = [
   "httpx>=0.27",
   "PyYAML>=6.0",
 ]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "build>=1.2", "twine>=5"]
+
+[project.urls]
+Homepage = "https://github.com/LatticeAG/ForgeDistill"
+Repository = "https://github.com/LatticeAG/ForgeDistill"
+Issues = "https://github.com/LatticeAG/ForgeDistill/issues"
 
 [project.scripts]
 distill = "distill_tools:main"
 eval_card = "eval_card:main"
 export_sft = "export_sft:main"
+dpo_pairs = "dpo_pairs:main"
+eval_live = "eval_live:main"
+archive_data = "archive_data:main"
+dataset_publish = "dataset_publish:main"
+forge-status = "status:main"
 
 [tool.setuptools]
 license-files = ["LICENSE"]
 package-dir = {"" = "src"}
+packages = ["forge_assets"]
 py-modules = [
   "agentic_plans",
   "archive_data",
   "curriculum",
+  "dataset_publish",
   "distill_tools",
   "dpo_pairs",
   "eval_card",
   "eval_live",
   "export_sft",
+  "lineage",
   "mock_tools",
   "prose_writer",
   "seed_bank",
   "status",
   "verifier",
 ]
+
+[tool.setuptools.package-data]
+forge_assets = ["templates/*.json", "roster.example.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

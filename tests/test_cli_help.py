@@ -101,3 +101,26 @@ def test_eval_live_help_flags():
     text = r.stdout
     for flag in ("--replay", "--max-turns", "--key-env", "--seed"):
         assert flag in text
+
+
+def test_dataset_publish_help_flags():
+    r = _help(_console_or_src("dataset_publish", "src/dataset_publish.py"))
+    assert r.returncode == 0, r.stderr
+    text = r.stdout
+    for flag in ("--input", "--out", "--check"):
+        assert flag in text
+
+
+def test_archive_data_help_flags():
+    r = _help(_console_or_src("archive_data", "src/archive_data.py"))
+    assert r.returncode == 0, r.stderr
+    assert "--label" in r.stdout
+
+
+def test_forge_status_help_flags():
+    r = _help(_console_or_src("forge-status", "src/status.py"))
+    assert r.returncode == 0, r.stderr
+    text = r.stdout + r.stderr
+    assert "--watch" in text
+    assert "TOTAL:" not in text
+    assert "usage:" in text.lower() or "Count traces" in text

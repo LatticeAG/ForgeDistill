@@ -1,0 +1,6 @@
+include LICENSE
+include SECURITY.md
+include AGENT.md
+include configs/templates/*.json
+include configs/roster.example.yaml
+include README.md
