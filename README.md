@@ -30,8 +30,10 @@
   <a href="#why-this-exists">Why This Exists</a> ·
   <a href="#how-it-works">How It Works</a> ·
   <a href="#quick-start">Quick Start</a> ·
+  <a href="#configuration">Configuration</a> ·
   <a href="#dataset-format">Dataset Format</a> ·
-  <a href="#verification">Verification</a>
+  <a href="#verification">Verification</a> ·
+  <a href="#known-issues">Known Issues</a>
 </p>
 
 ---
@@ -124,6 +126,46 @@ cat data/raw/traces_*.jsonl | python -m json.tool --json-lines | head -20
 After `pip install -e ".[dev]"`, console scripts on PATH: `distill`, `eval_card`, `export_sft`, `dpo_pairs`, `eval_live`, `archive_data`, `dataset_publish`, `forge-status`. Direct `python src/X.py` still works.
 
 Trace jsonl is append-guarded: the harness refuses to run over existing traces unless `--wipe` (which archives via `archive_data`, never unlinks). Derived `--out` paths (`eval_card.json`, `export_sft`, `dataset_publish` bundle files) replace on re-run.
+
+## Configuration
+
+Copy the example roster and point it at your OpenAI-compatible endpoints:
+
+```bash
+cp configs/roster.example.yaml configs/roster.yaml
+export MY_PROVIDER_KEY=sk-...   # keys live in env vars ONLY, never in the file
+distill --count 10 --pilot --roster configs/roster.yaml
+```
+
+Roster shape (verified from `configs/roster.example.yaml`):
+
+```yaml
+providers:
+  example-provider:
+    base_url: "https://api.example.com/v1"
+    key_env: "EXAMPLE_PROVIDER_KEY"   # env var holding the key
+    concurrency: 32
+    strict_tool_protocol: false       # true only if your router enforces tool_call_id pairing
+    models:
+      example-model-thinking: {mode: thinking, max_tokens: 2000, weight: 2}
+      example-model-concise:  {mode: concise, max_tokens: 1000, weight: 1}
+
+  local-router:                       # keyless local proxy
+    base_url: "http://127.0.0.1:PORT/v1"
+    key_env: ""                       # empty = no auth
+    concurrency: 64
+    models:
+      local-model-a: {mode: concise, max_tokens: 1000, weight: 1}
+```
+
+| Key | Description |
+|-----|-------------|
+| `mode` | `thinking` (reasoning models, keep `max_tokens >= 2000`) or `concise` (fast models, `max_tokens ~1000`). |
+| `weight` | Relative sampling weight — higher means more traces from that model. |
+| `concurrency` | Per-provider semaphore width. |
+| `strict_tool_protocol` | Set `true` only if your router enforces OpenAI `tool_call_id` pairing on tool messages. |
+
+`distill` flags: `--providers` / `--models` (comma-separated subsets), `--curriculum {off,uniform,linear}`, `--holdout-frac` (default `0.15`, `0` disables), `--verify-sample` / `--no-verify`, `--cross-teacher` / `--cross-teacher-rate`, `--dpo` / `--dpo-rate`, `--mp` / `--shard` (multiprocess; `--mp` child *i* uses seed + *i* × 7919), `--wipe`, `--out-dir` (default `data/raw`).
 
 ## Dataset Format
 
@@ -377,3 +419,10 @@ Configure teachers via a multi-provider OpenAI-compatible roster (`configs/roste
 ## License
 
 Released under the [MIT License](LICENSE). Built by [LatticeAG](https://github.com/LatticeAG).
+
+## Known Issues
+
+- **Live teacher endpoints required for generation** - the harness ships no teacher; without reachable `base_url`s and exported key env vars, `distill` cannot produce traces. Fixture-only verification (`eval_card --input tests/fixtures --require-gates`) works offline.
+- **PyPI install is an operator step** - `pip install latticeag-forge-distill` works only after an operator upload; until then use the editable install in Quick Start.
+- **Token-level mask check needs a checkpoint** - `--check-mask` validates message-level spans, but `--check-tokenizer` stays pending until a published `NANBEIGE_TOKENIZER` checkpoint plus an optional `transformers` install.
+- **No student checkpoint in this tree** - `eval_live` category rows are unscored without a `$STUDENT_URL` endpoint; CI covers the ReplayStudent path only.
