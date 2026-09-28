@@ -32,7 +32,14 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 from mock_tools import TOOL_DEFINITIONS, execute_tool_calls
 from seed_bank import pick_class, sample_seed
-from agentic_plans import PLANS, build_chain, validate_chain, trajectory_hash
+from agentic_plans import (
+    PLANS,
+    build_chain,
+    build_external_chain,
+    trajectory_hash,
+    validate_chain,
+    validate_external_chain,
+)
 from archive_data import archive_raw, default_archive_dir, files_to_archive
 from curriculum import pick_plan_index, split_plan_ids
 from dpo_pairs import build_pair
@@ -47,6 +54,7 @@ from prose_writer import (
 
 ROSTER_PATH = Path("configs/roster.yaml")
 OUT_DIR = Path("data/raw")
+EXTERNAL_CHAINS_PATH = Path("data/seeds/external_chains.jsonl")
 
 # Top-level roster keys that are never provider ids (flat or wrapped).
 RESERVED_ROSTER_KEYS = frozenset({
@@ -302,7 +310,9 @@ class Distiller:
                  dpo_enabled: bool = False,
                  dpo_rate: float = 1.0,
                  shard_i: int = 0,
-                 shard_n: int = 1):
+                 shard_n: int = 1,
+                 external_chains_path: str | None = None,
+                 external_frac: float = 0.0):
         self.roster = roster
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +346,28 @@ class Distiller:
             self.holdout_ids = set(hold)
             _atomic_write_json(hold_path, hold)
         self.external_prompts = self._load_external()
+        self.external_frac = float(external_frac)
+        self.external_chains: list[dict] = []
+        self._external_empty_logged = False
+        ext_path = (Path(external_chains_path) if external_chains_path
+                    else EXTERNAL_CHAINS_PATH)
+        if external_chains_path and not ext_path.exists():
+            print(f"external chains file not found: {ext_path}", file=sys.stderr)
+            raise SystemExit(2)
+        if ext_path.exists():
+            for line in ext_path.open(encoding="utf-8"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict) and isinstance(rec.get("steps"), list):
+                    self.external_chains.append(rec)
+        elif not external_chains_path:
+            print(f"[external] no {EXTERNAL_CHAINS_PATH}; external chain pool empty",
+                  file=sys.stderr)
         self.used_trajs: set[str] = set()
         for p in self.out_dir.glob("traces_*.jsonl"):
             for line in p.open(encoding="utf-8"):
@@ -753,7 +785,11 @@ class Distiller:
         if traj.get("seed_class") not in (None, "agentic"):
             return {"ok": False, "error": "non-agentic seed_class is frozen; reversed-v2 is agentic-only",
                     "http": "PLAN", "usage": {"input": 0, "output": 0}}
-        plan_err = validate_chain(traj["steps"])
+        plan_err = (
+            validate_external_chain(traj["steps"])
+            if traj.get("source") == "external"
+            else validate_chain(traj["steps"])
+        )
         if plan_err:
             return {"ok": False, "error": f"plan: {plan_err}", "http": "PLAN",
                     "usage": {"input": 0, "output": 0}}
@@ -960,15 +996,29 @@ class Distiller:
                 progress = (produced + 1) / max(count, 1)
                 try:
                     for _try in range(40):
-                        if self.curriculum_mode == "off":
-                            cand = build_chain(rng, exclude_ids=self.holdout_ids)
-                        else:
-                            idx = pick_plan_index(
-                                rng, PLANS, self.curriculum_mode, progress,
-                                self.holdout_ids,
-                            )
-                            cand = build_chain(rng, plan_index=idx,
-                                               exclude_ids=self.holdout_ids)
+                        cand = None
+                        if self.external_chains and rng.random() < self.external_frac:
+                            async with lock:
+                                rec = self.external_chains.pop() if self.external_chains else None
+                                if not self.external_chains and not self._external_empty_logged:
+                                    self._external_empty_logged = True
+                                    print("[external] chain pool exhausted; "
+                                          "continuing on plan chains only")
+                            if rec is not None:
+                                try:
+                                    cand = build_external_chain(rec)
+                                except ValueError:
+                                    cand = None
+                        if cand is None:
+                            if self.curriculum_mode == "off":
+                                cand = build_chain(rng, exclude_ids=self.holdout_ids)
+                            else:
+                                idx = pick_plan_index(
+                                    rng, PLANS, self.curriculum_mode, progress,
+                                    self.holdout_ids,
+                                )
+                                cand = build_chain(rng, plan_index=idx,
+                                                   exclude_ids=self.holdout_ids)
                         fh = trajectory_hash(cand)
                         if not shard_keeps(fh, self.shard_i, self.shard_n):
                             continue
@@ -1183,6 +1233,8 @@ def _mp_child(payload: dict) -> None:
         dpo_rate=payload["dpo_rate"],
         shard_i=payload["shard_i"],
         shard_n=payload["shard_n"],
+        external_chains_path=payload["external_chains_path"],
+        external_frac=payload["external_frac"],
     )
     asyncio.run(d.run(payload["count"], pilot=payload["pilot"]))
 
@@ -1206,6 +1258,8 @@ def run_mp(
     dpo_enabled: bool,
     dpo_rate: float,
     pilot: bool,
+    external_chains_path: str | None = None,
+    external_frac: float = 0.0,
 ) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1241,6 +1295,8 @@ def run_mp(
             "dpo_enabled": bool(dpo_enabled),
             "dpo_rate": float(dpo_rate),
             "pilot": bool(pilot),
+            "external_chains_path": external_chains_path,
+            "external_frac": float(external_frac),
         }
         p = ctx.Process(target=_mp_child, args=(payload,))
         p.start()
@@ -1335,6 +1391,12 @@ def main():
                     help="POSIX processes sharing out-dir via fcntl; 1 = in-process")
     ap.add_argument("--shard", default="0/1",
                     help="i/N (0-indexed) keep when int(traj_hash[:8],16)%%N==i; checked before teacher HTTP")
+    ap.add_argument("--external-chains", default=None,
+                    help="JSONL pool of corpus-derived chain records "
+                         f"(default: {EXTERNAL_CHAINS_PATH})")
+    ap.add_argument("--external-frac", type=float, default=0.0,
+                    help="fraction of agentic draws from the external chain pool, "
+                         "0..1 (default 0.0); pool exhaustion falls back to plans")
     args = ap.parse_args()
 
     if args.legacy_v1:
@@ -1343,6 +1405,9 @@ def main():
 
     mp_n = parse_mp(args.mp)
     shard_i, shard_n = parse_shard(args.shard)
+    if not (0.0 <= args.external_frac <= 1.0):
+        print("invalid --external-frac; expected a float in 0..1")
+        raise SystemExit(2)
     if mp_n > 1 and fcntl is None:
         print("fcntl missing; use --shard on separate machines")
         raise SystemExit(2)
@@ -1438,6 +1503,8 @@ def main():
         cross_teacher_rate=cross_teacher_rate,
         dpo_enabled=dpo_enabled,
         dpo_rate=dpo_rate,
+        external_chains_path=args.external_chains,
+        external_frac=args.external_frac,
     )
     if mp_n > 1:
         run_mp(
@@ -1459,6 +1526,8 @@ def main():
             dpo_enabled=dpo_enabled,
             dpo_rate=dpo_rate,
             pilot=args.pilot,
+            external_chains_path=args.external_chains,
+            external_frac=args.external_frac,
         )
         return
     d = Distiller(roster, out_dir, seed=args.seed, shard_i=shard_i, shard_n=shard_n,

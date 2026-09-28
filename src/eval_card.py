@@ -20,7 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from agentic_plans import PLANS, SKILLS, trajectory_hash, validate_chain
+from agentic_plans import (
+    PLANS,
+    SKILLS,
+    trajectory_hash,
+    validate_chain,
+    validate_external_chain,
+)
 from lineage import summarize
 from mock_tools import EMAIL_BY_USER, execute_one
 from prose_writer import (
@@ -219,8 +225,45 @@ def gate_grounding(trace, steps) -> str | None:
     return validate_answer_grounding(traj, final)
 
 
-def gate_chain(steps) -> str | None:
+def _is_external(trace) -> bool:
+    """External chains carry ext-<source>-<record_id> plan ids."""
+    return str(trace.get("plan_id") or "").startswith("ext-")
+
+
+def gate_chain(steps, trace=None) -> str | None:
+    """Chain gate: corpus chains get the generic structural rules only.
+
+    The internal laws in validate_chain (registered opaque addresses,
+    calendar attendees, recovery tagging) are properties of the mock tool
+    surface; corpus tool names are arbitrary.
+    """
+    if trace is not None and _is_external(trace):
+        return validate_external_chain(steps or [])
     return validate_chain(steps or [])
+
+
+def _external_fidelity(msgs: list[dict], steps: list[dict]) -> str | None:
+    """External chains have no mock executor to re-run; fidelity is that the
+    assistant tool_calls match the recorded chain in order and content."""
+    cursor = 0
+    for i, m in enumerate(msgs):
+        content = m.get("content") or ""
+        if m.get("role") != "assistant" or "<tool_call>" not in content:
+            continue
+        calls = _parse_tool_calls(content) or []
+        for call in calls:
+            if cursor >= len(steps):
+                return f"message {i}: more tool calls than chain steps"
+            s = steps[cursor]
+            if call.get("name") != s.get("tool"):
+                return (f"call {cursor}: name {call.get('name')!r} "
+                        f"!= chain tool {s.get('tool')!r}")
+            if _as_args(call.get("arguments")) != _as_args(s.get("args")):
+                return f"call {cursor}: arguments differ from chain record"
+            cursor += 1
+    if cursor != len(steps):
+        return f"{len(steps) - cursor} chain steps missing from messages"
+    return None
 
 
 def _collect_key_fields(obj: object, acc: dict | None = None) -> dict:
@@ -362,6 +405,11 @@ def gate_dependency_fidelity(trace, steps) -> str | None:
         if _parse_tool_calls(content) is None:
             return f"malformed <tool_call> JSON at message {i}"
 
+    if _is_external(trace):
+        # Corpus tools cannot be re-executed against the mock executor;
+        # fidelity for an external chain is the messages <-> chain match.
+        return _external_fidelity(msgs, seq)
+
     registered = set(EMAIL_BY_USER.values())
     has_calendar = any(s.get("tool") == "calendar.create" for s in seq)
     has_search_get = any(s.get("tool") == "search.get" for s in seq)
@@ -498,6 +546,7 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
     hashes: set[str] = set()
     skill_counts: Counter = Counter()
     plan_ids: set[str] = set()
+    ext_plan_ids: set[str] = set()
     tier_counts = {t: 0 for t in TIERS}
     routes: Counter = Counter()
 
@@ -507,7 +556,7 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
             n_prose += 1
         if gate_grounding(trace, steps) is None:
             n_ground += 1
-        if gate_chain(steps) is None:
+        if gate_chain(steps, trace) is None:
             n_chain += 1
         if gate_dependency_fidelity(trace, steps) is None:
             n_fid += 1
@@ -536,7 +585,10 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
             skill_counts[sk] += 1
         pid = trace.get("plan_id")
         if pid:
-            plan_ids.add(pid)
+            if str(pid).startswith("ext-"):
+                ext_plan_ids.add(str(pid))
+            else:
+                plan_ids.add(pid)
         tier = _tier_of(trace)
         if tier:
             tier_counts[tier] += 1
@@ -589,6 +641,7 @@ def compute_card(traces, token_usage=None, extra=None) -> dict:
             "n_tags_defined": len(SKILLS),
             "missing_tags": missing,
             "n_templates_used": len(plan_ids),
+            "n_external_templates_used": len(ext_plan_ids),
             "n_templates_defined": len(PLANS),
             "tier_counts": tier_counts,
             "coverage_note": COVERAGE_NOTE,
@@ -629,7 +682,7 @@ def stamp_eval(trace, traj, repaired=False, cross_teacher=False,
     trace["eval"] = {
         "format_ok": gate_prose(trace) is None,
         "grounding_ok": gate_grounding(trace, steps) is None,
-        "chain_ok": gate_chain(steps) is None,
+        "chain_ok": gate_chain(steps, trace) is None,
         "dependency_ok": gate_dependency_fidelity(trace, steps) is None,
         "n_rounds": _n_rounds(trace),
         "n_tool_calls": _n_tool_calls(trace, steps),

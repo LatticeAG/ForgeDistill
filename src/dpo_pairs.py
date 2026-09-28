@@ -105,7 +105,7 @@ def _four_gates(trace: dict, steps: list[dict] | None = None) -> dict:
     return {
         "prose": gate_prose(trace),
         "grounding": gate_grounding(trace, seq),
-        "chain": gate_chain(seq),
+        "chain": gate_chain(seq, trace),
         "fidelity": gate_dependency_fidelity(trace, seq),
     }
 
