@@ -26,6 +26,13 @@ This filename (`CHANGELOG.md`) matches no `.gitignore` pattern.
 
 The only producer of `res["teacher"]` on the fail path is a split thoughts/answer FORMAT failure (`fail["teacher"] = f"{ans_prov}/{ans_model}"`). A cross-teacher **answer-route parse failure** is therefore written to `rejects_{ans_prov}.jsonl` (the attempted answer teacher's provider). GROUNDING / VERIFY / assemble failures after a successful parse do not set `fail["teacher"]`, so those land under the thought-teacher worker `prov`.
 
+## [0.4.2] - 2026-09-28 - version assertion is no longer a literal
+
+`tests/test_packaging.py::test_pyproject_metadata` hardcoded `== "0.4.0"`, so the 0.4.1 bump failed the suite on a pure metadata change.
+
+- The test now asserts semver shape plus a matching `## [version]` CHANGELOG heading, which is the invariant that actually matters.
+- Tests: 177, green on 0.4.2.
+
 ## [0.4.1] - 2026-09-28 - public-bundle provenance scrub
 
 Published `eval_card.json` shipped the raw provenance: `input_paths` named the internal trace shards and `teachers.routes` / `tokens.by_route` named the internal routes and upstream model ids.

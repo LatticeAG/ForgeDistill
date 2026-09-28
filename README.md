@@ -371,7 +371,7 @@ configs/templates/*.json Chat templates (nanbeige, chatml); byte-match forge_ass
 configs/roster.example.yaml  Teacher fleet config template (copy to roster.yaml)
 tests/                   pytest suite
 .github/workflows/ci.yml CI: 3.11+3.12, pytest, gates, build/twine
-pyproject.toml           Package metadata and console scripts (0.4.1)
+pyproject.toml           Package metadata and console scripts (0.4.2)
 safe_launch.sh           Archive-first launcher (FORGE_PYTHON / .venv / python3)
 SECURITY.md              Vulnerability reporting; keys env-only
 AGENT.md                 Contributor conventions

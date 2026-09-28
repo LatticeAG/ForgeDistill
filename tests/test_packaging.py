@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -10,7 +11,13 @@ def test_pyproject_metadata():
     data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
     project = data["project"]
     assert project["name"] == "latticeag-forge-distill"
-    assert project["version"] == "0.4.0"
+    # The version is the release's single source of truth, so it is asserted
+    # structurally: semver shape plus a matching CHANGELOG heading. A hardcoded
+    # literal here fails the suite on every bump without catching anything.
+    version = project["version"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version), version
+    changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert f"## [{version}]" in changelog, f"CHANGELOG.md has no heading for {version}"
     deps = project["dependencies"]
     assert any("httpx" in d for d in deps)
     assert any("PyYAML" in d for d in deps)
