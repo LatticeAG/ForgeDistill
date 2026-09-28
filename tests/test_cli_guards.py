@@ -7,7 +7,8 @@ from pathlib import Path
 
 import yaml
 
-from distill_tools import Distiller, iter_provider_items
+import distill_tools
+from distill_tools import Distiller, _resolve_out_dir, iter_provider_items
 
 REPO = Path(__file__).resolve().parent.parent
 PY = sys.executable
@@ -214,3 +215,26 @@ def test_non_agentic_seed_class_rejects_not_raises(tmp_path: Path):
     assert res["ok"] is False
     assert res["http"] == "PLAN"
     assert "frozen" in res["error"]
+
+
+def test_relative_out_dir_resolves_against_cwd(tmp_path: Path):
+    r = _run(
+        [
+            "--count", "0",
+            "--out-dir", "rel/raw",
+            "--roster", str(EXAMPLE),
+            "--holdout-frac", "0",
+        ],
+        cwd=tmp_path,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "rel" / "raw").is_dir()
+    assert not (REPO / "rel").exists()
+
+
+def test_default_paths_are_cwd_relative(tmp_path: Path, monkeypatch):
+    assert distill_tools.ROSTER_PATH == Path("configs/roster.yaml")
+    assert distill_tools.OUT_DIR == Path("data/raw")
+    assert not hasattr(distill_tools, "ROOT")
+    monkeypatch.chdir(tmp_path)
+    assert _resolve_out_dir("rel/raw") == (tmp_path / "rel" / "raw").resolve()

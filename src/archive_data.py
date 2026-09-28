@@ -13,9 +13,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-RAW = ROOT / "data" / "raw"
-ARCHIVE = ROOT / "data" / "archive"
+RAW = Path("data/raw")
+ARCHIVE = Path("data/archive")
 
 # Extra artifacts that must leave a fresh raw dir (never ingest as traces).
 _EXTRA_NAMES = ("eval_card.json", "holdout_plan_ids.json")

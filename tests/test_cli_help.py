@@ -122,5 +122,6 @@ def test_forge_status_help_flags():
     assert r.returncode == 0, r.stderr
     text = r.stdout + r.stderr
     assert "--watch" in text
+    assert "--raw-dir" in text
     assert "TOTAL:" not in text
     assert "usage:" in text.lower() or "Count traces" in text

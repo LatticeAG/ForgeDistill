@@ -109,3 +109,14 @@ def test_manifest_excludes_operator_loops():
     assert "prod_loop.sh" not in text
     assert "loop_watcher.sh" not in text
 
+
+def test_requirements_dev_mirrors_pyproject():
+    data = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    extra = set(data["project"]["optional-dependencies"]["dev"])
+    pins = {
+        line.strip()
+        for line in (REPO / "requirements-dev.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    assert pins == extra
+

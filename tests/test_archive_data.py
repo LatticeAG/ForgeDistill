@@ -5,10 +5,10 @@ from pathlib import Path
 import archive_data
 
 
-def test_root_is_relative_to_package():
-    expected = Path(archive_data.__file__).resolve().parent.parent
-    assert archive_data.ROOT == expected
-    assert archive_data.ROOT.name  # not the old hardcoded absolute-only layout
+def test_raw_archive_defaults_are_cwd_relative():
+    assert archive_data.RAW == Path("data/raw")
+    assert archive_data.ARCHIVE == Path("data/archive")
+    assert not hasattr(archive_data, "ROOT")
 
 
 def test_move_not_copy_and_dest_exists(tmp_path: Path):

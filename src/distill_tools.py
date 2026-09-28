@@ -45,9 +45,8 @@ from prose_writer import (
     validate_prose_trace, validate_answer_grounding, DISTILL_VERSION,
 )
 
-ROOT = Path(__file__).resolve().parent.parent
-ROSTER_PATH = ROOT / "configs" / "roster.yaml"
-OUT_DIR = ROOT / "data" / "raw"
+ROSTER_PATH = Path("configs/roster.yaml")
+OUT_DIR = Path("data/raw")
 
 # Top-level roster keys that are never provider ids (flat or wrapped).
 RESERVED_ROSTER_KEYS = frozenset({
@@ -379,7 +378,7 @@ class Distiller:
 
     # ---- checkpointing -------------------------------------------------
     def _load_external(self) -> list[str]:
-        p = ROOT / "data" / "seeds" / "external.jsonl"
+        p = Path("data/seeds/external.jsonl")
         if not p.exists():
             return []
         prompts = []
@@ -1274,10 +1273,7 @@ def run_mp(
 
 
 def _resolve_out_dir(path: str) -> Path:
-    p = Path(path)
-    if not p.is_absolute():
-        p = ROOT / p
-    return p
+    return Path(path).expanduser().resolve()
 
 
 def _pilot_defaults(roster: dict) -> tuple[list[str], list[str]]:

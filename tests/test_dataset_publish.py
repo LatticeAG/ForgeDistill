@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import dataset_publish as dp
 
 
-def _trace(teacher: str = "lexgf/crow-grok-4.3") -> dict:
+def _trace(teacher: str = "example-provider/example-model-thinking") -> dict:
     return {
         "seed_class": "agentic",
         "prompt": "Email user 42",
@@ -98,7 +98,7 @@ def test_publish_end_to_end(tmp_path):
     raw = tmp_path / "raw"
     raw.mkdir()
     (raw / "traces_prov.jsonl").write_text(
-        json.dumps(_trace()) + "\n" + json.dumps(_trace("lexzm/deepseek/deepseek-v4-pro")) + "\n",
+        json.dumps(_trace()) + "\n" + json.dumps(_trace("local-router/local-model-a")) + "\n",
         encoding="utf-8",
     )
     (raw / "dpo_pairs_prov.jsonl").write_text(
@@ -141,9 +141,9 @@ def test_publish_scrubs_lineage_teacher(tmp_path):
         "plan_id": "plan_user-email-welcome",
         "plan_tier": "easy",
         "plan_skills": ["multi_hop"],
-        "teacher": "lexgf/crow-grok-4.3",
-        "teacher_thoughts": "lexgf/crow-grok-4.3",
-        "teacher_answer": "lexgf/crow-grok-4.3",
+        "teacher": "example-provider/example-model-thinking",
+        "teacher_thoughts": "example-provider/example-model-thinking",
+        "teacher_answer": "example-provider/example-model-thinking",
         "teacher_mode": "thinking",
         "tokens_in": 11,
         "tokens_out": 5,

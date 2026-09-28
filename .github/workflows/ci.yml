@@ -41,3 +41,26 @@ jobs:
           python -m build
           twine check dist/*
           python -c "import tarfile,glob; t=tarfile.open(glob.glob('dist/*.tar.gz')[0]); n=set(t.getnames()); assert any(x.endswith('dataset_publish.py') for x in n); assert any(x.endswith('forge_assets/templates/nanbeige.json') for x in n)"
+
+  wheel-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Wheel install smoke
+        run: |
+          pip install build
+          python -m build
+          python -m venv "$RUNNER_TEMP/venv" && . "$RUNNER_TEMP/venv/bin/activate"
+          pip install dist/*.whl
+          cp tests/fixtures/mini_traces.jsonl "$RUNNER_TEMP/traces_fixture.jsonl"
+          cd "$RUNNER_TEMP"
+          python -c "import distill_tools, lineage, forge_assets; print('OK')"
+          distill --help && forge-status --raw-dir . && export_sft --input traces_fixture.jsonl --out out.jsonl --check-mask
+          eval_card --input traces_fixture.jsonl --require-gates

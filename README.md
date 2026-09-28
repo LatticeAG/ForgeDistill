@@ -104,7 +104,7 @@ cd ForgeDistill
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-# 2. When this version is on PyPI (operator upload; not claimed from this tree)
+# 2. Or from PyPI (published release)
 pip install latticeag-forge-distill
 
 # 3. Configure your multi-provider OpenAI-compatible roster
@@ -423,6 +423,6 @@ Released under the [MIT License](LICENSE). Built by [LatticeAG](https://github.c
 ## Known Issues
 
 - **Live teacher endpoints required for generation** - the harness ships no teacher; without reachable `base_url`s and exported key env vars, `distill` cannot produce traces. Fixture-only verification (`eval_card --input tests/fixtures --require-gates`) works offline.
-- **PyPI install is an operator step** - `pip install latticeag-forge-distill` works only after an operator upload; until then use the editable install in Quick Start.
+
 - **Token-level mask check needs a checkpoint** - `--check-mask` validates message-level spans, but `--check-tokenizer` stays pending until a published `NANBEIGE_TOKENIZER` checkpoint plus an optional `transformers` install.
 - **No student checkpoint in this tree** - `eval_live` category rows are unscored without a `$STUDENT_URL` endpoint; CI covers the ReplayStudent path only.
