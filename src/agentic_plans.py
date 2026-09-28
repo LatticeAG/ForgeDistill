@@ -978,3 +978,107 @@ def validate_chain(steps: list[dict]) -> str | None:
     if last["result"].get("status") != 200 and last.get("expect") not in ("error", "stop"):
         return "chain does not complete (final step failed)"
     return None
+
+
+# ----------------------------------------------------------------------
+# External chains. Corpus-derived trajectories (src/external_chains.py)
+# are first-class citizens: they get the GENERIC structural rules only.
+# The internal laws (registered opaque addresses, calendar attendees,
+# recovery tagging) are properties of the mock tool surface in
+# mock_tools.py and of plan templates; corpus tool names are arbitrary.
+# ----------------------------------------------------------------------
+def validate_external_chain(steps: list[dict]) -> str | None:
+    """Generic structural check for corpus-derived chains.
+
+    Rules:
+    - non-empty
+    - every step: non-empty string tool, dict args, dict result with status
+    - the FINAL step must be status 200 unless expect is error/stop
+    """
+    if not steps:
+        return "empty chain"
+    for i, s in enumerate(steps):
+        if not isinstance(s, dict):
+            return f"step {i}: not a dict"
+        tool = s.get("tool")
+        if not isinstance(tool, str) or not tool.strip():
+            return f"step {i}: missing tool name"
+        if not isinstance(s.get("args"), dict):
+            return f"step {i}: args not a dict"
+        r = s.get("result")
+        if not isinstance(r, dict) or "status" not in r:
+            return f"step {i}: result missing status"
+    last = steps[-1]
+    if last["result"].get("status") != 200 and last.get("expect") not in ("error", "stop"):
+        return "chain does not complete (final step failed)"
+    return None
+
+
+def external_tier(steps: list[dict]) -> str:
+    """Difficulty tier from chain depth. Stays inside the four plan tiers."""
+    n = len(steps or [])
+    if n <= 1:
+        return "easy"
+    if n == 2:
+        return "medium"
+    if n <= 4:
+        return "hard"
+    return "expert"
+
+
+_SEARCH_HINTS = ("search", "find", "lookup", "trend", "quote")
+_ARITH_HINTS = ("calc", "convert", "exchange", "price", "sum", "average")
+
+
+def external_skills(steps: list[dict]) -> list[str]:
+    """Inferred skill tags for a corpus chain. Every tag must exist in SKILLS."""
+    steps = steps or []
+    names = [str(s.get("tool") or "").lower() for s in steps]
+    out: list[str] = []
+    if len(steps) > 1:
+        out.append("multi_hop")
+    rounds: dict[int, int] = {}
+    for s in steps:
+        r = s.get("round", 0)
+        rounds[r] = rounds.get(r, 0) + 1
+    if any(c > 1 for c in rounds.values()):
+        out.append("fanout")
+    if any(any(h in n for h in _SEARCH_HINTS) for n in names):
+        out.append("search")
+    if any(any(h in n for h in _ARITH_HINTS) for n in names):
+        out.append("arithmetic")
+    if len(set(names)) < len(names):
+        out.append("recovery")
+    return [t for t in out if t in SKILLS]
+
+
+def build_external_chain(record: dict) -> dict:
+    """Turn one external_chains.py record into a standard trajectory dict.
+
+    Raises ValueError on any record failing validate_external_chain -
+    fail loudly, never silently degrade.
+    """
+    steps = record.get("steps")
+    err = validate_external_chain(steps if isinstance(steps, list) else [])
+    if err:
+        raise ValueError(f"external record {record.get('record_id')!r}: {err}")
+    source = str(record.get("source") or "unknown")
+    record_id = str(record.get("record_id") or "noid")
+    out_steps = []
+    for i, s in enumerate(steps):
+        st = dict(s)
+        st["expect"] = st.get("expect", "success")
+        st["step_index"] = i
+        out_steps.append(st)
+    return {
+        "prompt": record.get("prompt") or "",
+        "steps": out_steps,
+        "vars": {},
+        "plan_index": -1,
+        "plan_id": f"ext-{source}-{record_id}",
+        "skills": external_skills(steps),
+        "tier": external_tier(steps),
+        "seed_class": "agentic",
+        "source": "external",
+        "result_source": record.get("result_source"),
+    }
