@@ -26,6 +26,65 @@ This filename (`CHANGELOG.md`) matches no `.gitignore` pattern.
 
 The only producer of `res["teacher"]` on the fail path is a split thoughts/answer FORMAT failure (`fail["teacher"] = f"{ans_prov}/{ans_model}"`). A cross-teacher **answer-route parse failure** is therefore written to `rejects_{ans_prov}.jsonl` (the attempted answer teacher's provider). GROUNDING / VERIFY / assemble failures after a successful parse do not set `fail["teacher"]`, so those land under the thought-teacher worker `prov`.
 
+## [0.5.0] - 2026-09-28 - external chain lane (corpus -> chain records)
+
+The agentic task space is finite (47 plan templates, ~1.6k unique chains).
+The declared escape hatch - `harvest_prompts.py` writing
+`data/seeds/external.jsonl` - was dead end-to-end: its extractor understood
+none of the declared source shapes and `self.external_prompts` was loaded
+but never read. This release wires the inverse direction: the corpus
+supplies the tool calls, the teacher still writes prose only.
+
+- `src/external_chains.py` (operator script, deliberately unpackaged like
+  `harvest_prompts.py`): fetches rows from the HF datasets-server API with
+  stdlib urllib and emits one chain record per call segment.
+  - `Team-ACE/ToolACE` (`default`/`train`, Apache-2.0): ShareGPT turns;
+    `Name(args)` call blocks paired with recorded `{"name", "results"}`
+    tool turns. Segments drop (never guess) on unmatched results, non-JSON
+    payloads, base64/data:image payloads, prompt length outside 8..400,
+    or more than 6 steps.
+  - `lockon/xlam-function-calling-60k` (`dataset`/`train`, CC-BY-4.0):
+    ships calls without results, so results are synthesized
+    deterministically from `sha256(tool|args_json|prop)` over each
+    declared schema property; declared args echo through. Honest caveat:
+    xLAM `result` payloads are synthetic placeholders - they carry real
+    call structure, not real API responses. `result_source` records
+    `recorded` vs `synthesized` on every record.
+  - CLI: `--source toolace|xlam|both`, `--max-rows`, `--out`
+    (default `data/seeds/external_chains.jsonl`, CWD-relative), `--append`,
+    `--check PATH` (per-source counts + duplicate record_ids).
+- `src/agentic_plans.py`: `validate_external_chain` (generic structural
+  rules only - the internal mock-surface laws do not apply to corpus tool
+  names), `external_tier` (1 easy / 2 medium / 3-4 hard / 5+ expert),
+  `external_skills` (only tags already in SKILLS), `build_external_chain`
+  (`plan_id=ext-<source>-<record_id>`, `seed_class="agentic"`, raises
+  ValueError on invalid records).
+- `src/distill_tools.py`: `Distiller(external_chains_path=, external_frac=)`
+  loads the JSONL pool once; explicit missing path is a hard error, missing
+  default path logs one stderr note. In the worker loop a non-empty pool
+  and `rng.random() < external_frac` draws the next unused record under the
+  existing lock, applies the same trajectory_hash + shard_keeps +
+  used_trajs claim, and falls through to the plan path on exhaustion,
+  duplicate, or shard reject (logged once when the pool empties).
+  `--external-chains` / `--external-frac` CLI flags; plumbed through
+  `run_mp` payloads like `dpo_rate`. `generate_agentic_trace` dispatches
+  to `validate_external_chain` when `traj["source"] == "external"`.
+- `src/eval_card.py`: `gate_chain(steps, trace)` and
+  `gate_dependency_fidelity` dispatch on the `ext-` plan_id prefix -
+  corpus chains cannot re-execute against the mock executor, so fidelity
+  is the messages<->chain match. `skills.n_templates_used` now counts
+  internal plan ids only; `n_external_templates_used` reports the corpus
+  side separately.
+- `src/dpo_pairs.py`: `_four_gates` passes the trace to `gate_chain`.
+- `src/harvest_prompts.py`: extractor learned the ShareGPT `from`/`value`
+  shape (hermes, ToolACE) and the glaive plain-text `USER:`/`ASSISTANT:`
+  chat blob; SOURCES gained ToolACE and xLAM; `OUT` is CWD-relative
+  `data/seeds/external.jsonl` (ROOT deleted, matching the 0.4.0 tree
+  convention). The prompt lane stays a prompt source and is still NOT
+  wired into generation: an arbitrary external prompt over an unrelated
+  deterministic chain would break the grounding gate.
+- Tests: 204 (0.4.2 + 27), all offline.
+
 ## [0.4.2] - 2026-09-28 - version assertion is no longer a literal
 
 `tests/test_packaging.py::test_pyproject_metadata` hardcoded `== "0.4.0"`, so the 0.4.1 bump failed the suite on a pure metadata change.

@@ -165,7 +165,44 @@ providers:
 | `concurrency` | Per-provider semaphore width. |
 | `strict_tool_protocol` | Set `true` only if your router enforces OpenAI `tool_call_id` pairing on tool messages. |
 
-`distill` flags: `--providers` / `--models` (comma-separated subsets), `--curriculum {off,uniform,linear}`, `--holdout-frac` (default `0.15`, `0` disables), `--verify-sample` / `--no-verify`, `--cross-teacher` / `--cross-teacher-rate`, `--dpo` / `--dpo-rate`, `--mp` / `--shard` (multiprocess; `--mp` child *i* uses seed + *i* × 7919), `--wipe`, `--out-dir` (default `data/raw`).
+`distill` flags: `--providers` / `--models` (comma-separated subsets), `--curriculum {off,uniform,linear}`, `--holdout-frac` (default `0.15`, `0` disables), `--verify-sample` / `--no-verify`, `--cross-teacher` / `--cross-teacher-rate`, `--dpo` / `--dpo-rate`, `--mp` / `--shard` (multiprocess; `--mp` child *i* uses seed + *i* × 7919), `--wipe`, `--out-dir` (default `data/raw`), `--external-chains` / `--external-frac`.
+
+### External corpora
+
+The 47 plan templates bound the internal task space. The escape hatch is
+the chain lane: `src/external_chains.py` (operator-only, not packaged)
+fetches rows from public tool-calling corpora and writes chain records to
+`data/seeds/external_chains.jsonl`. `distill --external-frac 0.3` then
+draws that fraction of agentic trajectories from the pool; the corpus
+supplies the calls and the teacher still writes only prose, so the
+grounding gate is preserved.
+
+```bash
+python src/external_chains.py --source both --max-rows 2000
+python src/external_chains.py --check data/seeds/external_chains.jsonl
+distill --count 500 --external-chains data/seeds/external_chains.jsonl --external-frac 0.3
+```
+
+Two sources, two honesty levels:
+
+- **ToolACE** (`Team-ACE/ToolACE`, Apache-2.0) - multi-turn dialogues with
+  *recorded* tool results (`result_source="recorded"`). One record per
+  user-request segment; multi-call turns keep their `round` index.
+- **xLAM** (`lockon/xlam-function-calling-60k`, CC-BY-4.0) - queries with
+  calls but no results, so `result_source="synthesized"`: each result is a
+  deterministic `{"ok": true, "tool", "args", "data"}` payload derived from
+  `sha256(tool|args|prop)` per declared schema property. These payloads are
+  synthetic placeholders - real call structure, not real API responses -
+  and every record's `tool_schemas` field keeps the corpus schema so the
+  synthesis is auditable.
+
+External traces carry `plan_id=ext-<source>-<record_id>`; eval_card counts
+them under `n_external_templates_used`, applies the generic chain gate,
+and checks fidelity as messages matching the recorded chain rather than
+mock re-execution. When the pool empties the run logs once and continues
+on plan chains. `harvest_prompts.py` remains a prompt-only lane and is not
+wired into generation: an arbitrary external prompt over an unrelated
+deterministic chain would break the grounding gate.
 
 ## Dataset Format
 
@@ -364,6 +401,7 @@ src/dataset_publish.py   Public-safe HuggingFace bundle scrubber
 src/lineage.py           Run lineage ledger helpers (kept/reject/summarize)
 src/status.py            forge-status: count traces_*.jsonl
 src/seed_bank.py         Frozen legacy-v1 seeds (packaged, generator not called)
+src/external_chains.py   Operator-only corpus -> chain-record ingest (not packaged)
 src/harvest_prompts.py   Unpackaged legacy HF harvest (operator-only)
 src/dedup_filter.py      Unpackaged legacy prompt filter
 src/forge_assets/        Installed template pack + roster.example.yaml
@@ -371,14 +409,14 @@ configs/templates/*.json Chat templates (nanbeige, chatml); byte-match forge_ass
 configs/roster.example.yaml  Teacher fleet config template (copy to roster.yaml)
 tests/                   pytest suite
 .github/workflows/ci.yml CI: 3.11+3.12, pytest, gates, build/twine
-pyproject.toml           Package metadata and console scripts (0.4.2)
+pyproject.toml           Package metadata and console scripts (0.5.0)
 safe_launch.sh           Archive-first launcher (FORGE_PYTHON / .venv / python3)
 SECURITY.md              Vulnerability reporting; keys env-only
 AGENT.md                 Contributor conventions
 LICENSE                  MIT
 ```
 
-`harvest_prompts.py` and `dedup_filter.py` are unpackaged legacy (excluded from py-modules). `forge_assets` is the wheel template pack.
+`external_chains.py`, `harvest_prompts.py`, and `dedup_filter.py` are operator-only scripts (excluded from py-modules). `forge_assets` is the wheel template pack.
 
 ## Publishing
 
