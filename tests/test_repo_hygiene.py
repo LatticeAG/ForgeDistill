@@ -28,6 +28,37 @@ def _require_git_checkout() -> None:
         pytest.skip("not a git checkout")
 
 
+TEXT_SUFFIXES = (
+    ".py", ".md", ".txt", ".yml", ".yaml", ".toml", ".cfg", ".in", ".sh", ".json",
+)
+
+
+def _iter_text_files():
+    """Yield (rel_path, text) for every tracked text file (fallback: tree walk).
+
+    Aliases leaked into any published file (docs, changelog, tests) are the
+    failure mode; scanning the whole tracked set is the only way to catch one
+    that lands outside tests/src/configs/README.
+    """
+    _require_git_checkout()
+    listed = _git("ls-files", "-z")
+    rels = [p for p in listed.stdout.split("\0") if p]
+    if not rels:
+        rels = [
+            str(f.relative_to(REPO))
+            for f in REPO.rglob("*")
+            if f.is_file()
+            and ".git" not in f.parts
+            and "__pycache__" not in f.parts
+            and ".venv" not in f.parts
+        ]
+    for rel in rels:
+        p = REPO / rel
+        if not p.is_file() or p.suffix.lower() not in TEXT_SUFFIXES:
+            continue
+        yield rel, p.read_text(encoding="utf-8", errors="replace")
+
+
 def test_operator_loops_untracked():
     _require_git_checkout()
     r = _git("ls-files", "prod_loop.sh", "loop_watcher.sh")
@@ -49,15 +80,9 @@ def test_no_home_ubuntu_paths_in_tracked_files():
 
 def test_no_internal_route_aliases():
     aliases = ["lex" + "gf", "lex" + "zm", "nvd" + "acf", "kim" + "cf"]
-    pat = "|".join(re.escape(a) for a in aliases)
-    blob_parts: list[str] = []
-    for rel in ("tests", "src", "configs", "README.md"):
-        p = REPO / rel
-        if p.is_file():
-            blob_parts.append(p.read_text(encoding="utf-8", errors="replace"))
-            continue
-        for f in p.rglob("*"):
-            if f.is_file() and "__pycache__" not in f.parts:
-                blob_parts.append(f.read_text(encoding="utf-8", errors="replace"))
-    blob = "".join(blob_parts)
-    assert re.search(pat, blob) is None
+    pat = re.compile("|".join(re.escape(a) for a in aliases))
+    hits = []
+    for rel, text in _iter_text_files():
+        if pat.search(text):
+            hits.append(rel)
+    assert hits == [], hits

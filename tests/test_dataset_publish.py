@@ -162,3 +162,71 @@ def test_publish_scrubs_lineage_teacher(tmp_path):
     assert rec["kept"] is True
     assert "teacher_mode" not in rec
     dp.assert_clean([rec], "lineage")
+
+
+def _card(provider: str = "example-provider") -> dict:
+    return {
+        "forge_spec": "0.2",
+        "distill_version": "reversed-v2",
+        "input_paths": [
+            f"data/raw/traces_{provider}.jsonl",
+            "data/raw/traces_other.jsonl",
+        ],
+        "n_traces": 4,
+        "teachers": {
+            "routes": {
+                f"{provider}/example-model-a": 1,
+                f"{provider}/example-model-b": 3,
+            },
+            "cross_teacher_rate": 0.0,
+        },
+        "tokens": {
+            "input": 10,
+            "output": 4,
+            "by_route": {f"{provider}/example-model-a": {"input": 1, "output": 1}},
+        },
+        "skills": {"counts": {"search": 1}, "n_templates_used": 1, "n_templates_defined": 47},
+    }
+
+
+def test_scrub_eval_card_anonymises_routes_and_shards():
+    out = dp.scrub_eval_card(_card())
+    assert sorted(out["teachers"]["routes"]) == ["teacher-01", "teacher-02"]
+    assert all(k.startswith("teacher-") for k in out["tokens"]["by_route"])
+    assert out["input_paths"] == [
+        "data/raw/traces_shard_1.jsonl",
+        "data/raw/traces_shard_2.jsonl",
+    ]
+    # counts survive: that is the reproducibility signal, identities are not
+    assert sorted(out["teachers"]["routes"].values()) == [1, 3]
+    assert out["n_traces"] == 4
+    assert out["tokens"]["by_route"]["teacher-01"] == {"input": 1, "output": 1}
+    blob = json.dumps(out)
+    assert "example-provider" not in blob
+    assert "example-model" not in blob
+
+
+def test_assert_clean_card_rejects_unscrubbed_route():
+    import pytest
+
+    with pytest.raises(AssertionError):
+        dp.assert_clean_card(_card())
+
+
+def test_publish_scrubs_eval_card(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "traces_prov.jsonl").write_text(json.dumps(_trace()) + "\n", encoding="utf-8")
+    (raw / "eval_card.json").write_text(json.dumps(_card()), encoding="utf-8")
+    out = tmp_path / "bundle"
+    dp.publish(raw, out)
+    blob = (out / "eval_card.json").read_text(encoding="utf-8")
+    assert "example-provider" not in blob
+    assert "example-model" not in blob
+    card = json.loads(blob)
+    assert card["input_paths"] == [
+        "data/raw/traces_shard_1.jsonl",
+        "data/raw/traces_shard_2.jsonl",
+    ]
+    assert card["n_traces"] == 4
+    assert "provenance_note" in card

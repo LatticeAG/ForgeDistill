@@ -44,6 +44,11 @@ INTERNAL_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The only route shape allowed in a public bundle: an anonymised label.
+# `traces_shard_N.jsonl` is the only permitted input_paths shape.
+ROUTE_KEY_RE = re.compile(r"\Ateacher-\d{2}\Z")
+SHARD_PATH_RE = re.compile(r"\Adata/raw/traces_shard_\d+\.jsonl\Z")
+
 
 def scrub_trace(trace: dict) -> dict:
     """Return a public-safe copy of an SFT trace (slim, no internal keys)."""
@@ -109,6 +114,75 @@ def _keys_of(rec: dict) -> set[str]:
     return keys
 
 
+def _anon_route_map(*sources: object) -> dict[str, str]:
+    """Stable `route -> teacher-NN` mapping over every route seen."""
+    keys: set[str] = set()
+    for src in sources:
+        if isinstance(src, dict):
+            keys.update(str(k) for k in src)
+    return {k: f"teacher-{i:02d}" for i, k in enumerate(sorted(keys), start=1)}
+
+
+def scrub_eval_card(card: dict) -> dict:
+    """Anonymise provenance in the published eval card.
+
+    The raw card names internal route identifiers in `input_paths`,
+    `teachers.routes` and `tokens.by_route`. The public bundle keeps every
+    count (that is the reproducibility signal) and replaces the identities
+    with stable `teacher-NN` / `traces_shard_N.jsonl` labels, so the card
+    can ship with the dataset without disclosing routing topology.
+    """
+    out = copy.deepcopy(card)
+    paths = out.get("input_paths")
+    if isinstance(paths, list):
+        out["input_paths"] = [
+            f"data/raw/traces_shard_{i}.jsonl" for i in range(1, len(paths) + 1)
+        ]
+
+    teachers = out.get("teachers")
+    tokens = out.get("tokens")
+    routes = teachers.get("routes") if isinstance(teachers, dict) else None
+    by_route = tokens.get("by_route") if isinstance(tokens, dict) else None
+    mapping = _anon_route_map(routes, by_route)
+    if isinstance(routes, dict):
+        out["teachers"]["routes"] = {mapping[str(k)]: v for k, v in routes.items()}
+    if isinstance(by_route, dict):
+        out["tokens"]["by_route"] = {mapping[str(k)]: v for k, v in by_route.items()}
+    out["provenance_note"] = (
+        "teacher route identities and input shard names are anonymised in the "
+        "public bundle; all counts are unmodified"
+    )
+    assert_clean_card(out)
+    return out
+
+
+def assert_clean_card(card: dict) -> None:
+    """Fail if any route identity survived scrubbing.
+
+    Route keys must be `teacher-NN`; input shard names must be the generic
+    `data/raw/traces_shard_N.jsonl` form. Anything else is a provider/model
+    identifier on its way to a public bundle.
+    """
+    bad: list[str] = []
+    teachers = card.get("teachers")
+    tokens = card.get("tokens")
+    for label, keys in (
+        ("teachers.routes", (teachers or {}).get("routes") or {}),
+        ("tokens.by_route", (tokens or {}).get("by_route") or {}),
+    ):
+        for k in keys:
+            if not ROUTE_KEY_RE.match(str(k)):
+                bad.append(f"{label}:{k}")
+    for p in card.get("input_paths") or []:
+        if not SHARD_PATH_RE.match(str(p)):
+            bad.append(f"input_paths:{p}")
+    if bad:
+        raise AssertionError(
+            f"eval_card: {len(bad)} unscrubbed identity field(s): "
+            + ", ".join(sorted(bad)[:5])
+        )
+
+
 def assert_clean(records: list[dict], kind: str) -> None:
     """Fail loudly if any top-level or side field is not in the public set.
 
@@ -171,9 +245,11 @@ def publish(input_dir: Path, out_dir: Path, check: bool = False) -> dict:
 
     card = input_dir / "eval_card.json"
     if card.exists():
-        import shutil
-
-        shutil.copyfile(card, out_dir / "eval_card.json")
+        raw = json.loads(card.read_text(encoding="utf-8"))
+        (out_dir / "eval_card.json").write_text(
+            json.dumps(scrub_eval_card(raw), indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     summary = {"sft": len(sft), "dpo": len(pairs), "lineage": len(lineage)}
     if check:

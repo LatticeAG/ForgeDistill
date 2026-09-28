@@ -26,6 +26,15 @@ This filename (`CHANGELOG.md`) matches no `.gitignore` pattern.
 
 The only producer of `res["teacher"]` on the fail path is a split thoughts/answer FORMAT failure (`fail["teacher"] = f"{ans_prov}/{ans_model}"`). A cross-teacher **answer-route parse failure** is therefore written to `rejects_{ans_prov}.jsonl` (the attempted answer teacher's provider). GROUNDING / VERIFY / assemble failures after a successful parse do not set `fail["teacher"]`, so those land under the thought-teacher worker `prov`.
 
+## [0.4.1] - 2026-09-28 - public-bundle provenance scrub
+
+Published `eval_card.json` shipped the raw provenance: `input_paths` named the internal trace shards and `teachers.routes` / `tokens.by_route` named the internal routes and upstream model ids.
+
+- `dataset_publish.scrub_eval_card` now anonymises the card in the public bundle: route keys become `teacher-NN`, `input_paths` become `data/raw/traces_shard_N.jsonl`, every count is preserved, and a `provenance_note` records the substitution.
+- `dataset_publish.assert_clean_card` fails the publish if any route identity survives scrubbing.
+- `test_no_internal_route_aliases` now scans every tracked text file instead of only `tests/`, `src/`, `configs/`, `README.md` (a CHANGELOG edit had carried the aliases past the old scope).
+- Tests: 177 (0.4.0 + 3).
+
 ## [0.4.0] - 2026-09-28 - Phase 1 production-readiness
 
 Amendments **A1** (CWD-relative paths) and the G1–G5 realizations below. Features F1/F2 and the 0.5.0 version bump are not in this phase.
@@ -44,7 +53,7 @@ Amendments **A1** (CWD-relative paths) and the G1–G5 realizations below. Featu
 
 ### G4 — internal route aliases removed from tests
 
-`tests/test_dataset_publish.py` uses `example-provider/example-model-thinking` and `local-router/local-model-a`. `test_no_internal_route_aliases` greps `tests/`, `src/`, `configs/`, `README.md` for `lexgf|lexzm|nvdacf|kimcf`.
+`tests/test_dataset_publish.py` uses `example-provider/example-model-thinking` and `local-router/local-model-a`. `test_no_internal_route_aliases` scans every tracked text file (built from fragments so the test does not itself carry the names) for the internal route-alias pattern. The published `eval_card.json` is anonymised by `dataset_publish.scrub_eval_card`: route keys become `teacher-NN`, shard paths become `data/raw/traces_shard_N.jsonl`, counts are preserved, and `assert_clean_card` fails the publish if any identity survives.
 
 ### G5 — `requirements-dev.txt` mirrors the dev extra
 
