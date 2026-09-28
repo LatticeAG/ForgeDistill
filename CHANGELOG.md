@@ -26,6 +26,27 @@ This filename (`CHANGELOG.md`) matches no `.gitignore` pattern.
 
 The only producer of `res["teacher"]` on the fail path is a split thoughts/answer FORMAT failure (`fail["teacher"] = f"{ans_prov}/{ans_model}"`). A cross-teacher **answer-route parse failure** is therefore written to `rejects_{ans_prov}.jsonl` (the attempted answer teacher's provider). GROUNDING / VERIFY / assemble failures after a successful parse do not set `fail["teacher"]`, so those land under the thought-teacher worker `prov`.
 
+## [0.5.1] - 2026-09-28 - prose format contract (reminder + label fallback)
+
+Measured on 60 live teacher replies (a stealth-preview teacher): 24 were
+rejected purely for missing `<thought>` tags while every one of the 60 passed
+grounding. The prompt already showed the tag template - some teachers read it
+as illustrative and emit bare labelled lines instead. That is a parsing gap,
+not a model defect, so the accepted input is widened while the output contract
+stays exactly as it was.
+
+- `build_prose_prompt` now ends with an explicit literal-syntax reminder.
+- `parse_teacher_output` accepts a second input axis: labelled prose
+  (`THOUGHTS:` / `FINAL_ANSWER:`, no tags). Deliberately strict - it needs at
+  least n thought units of real length, and the grounding gate still validates
+  the final answer afterwards.
+- `assemble_trace` re-emits canonical `<thought>` tags for both axes, so the
+  exported trace is identical whichever axis the teacher used. The axis is
+  recorded on the trace as `prose_format` (`"tags"` | `"labels"`) for eval.
+- `parse_final` now stops at a following labelled section, so a trailing
+  `REASONING:` block (teacher scratch) cannot leak into the student's final turn.
+- 7 new tests, 211 total.
+
 ## [0.5.0] - 2026-09-28 - external chain lane (corpus -> chain records)
 
 The agentic task space is finite (47 plan templates, ~1.6k unique chains).

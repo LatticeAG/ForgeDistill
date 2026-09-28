@@ -20,6 +20,30 @@ import re
 from mock_tools import EMAIL_BY_USER, USERS
 
 THOUGHT_RE = re.compile(r"<thought>(.*?)</thought>", re.S)
+
+# Literal-syntax reminder. Some teachers (measured on a stealth-preview model) read the
+# tag template further down as illustrative and emit bare labelled lines instead,
+# which the tag gate then rejects - that was 24 of 60 pilot replies. Spell the
+# requirement out, and let the label fallback in parse_teacher_output catch the rest.
+LITERAL_TAG_REMINDER = (
+    "LITERAL SYNTAX: every thought must be wrapped in the literal characters "
+    "<thought> and </thought>, e.g. <thought>I will call get_user with user_id 9999 "
+    "first.</thought>. Use the angle-bracket tags exactly as shown - not labels, not "
+    "quotes, not numbering. A reply whose thoughts are not inside separate "
+    "<thought>...</thought> blocks is rejected."
+)
+
+# Label-shaped reply fallback: a "THOUGHTS:" section followed by "FINAL_ANSWER:".
+# Tags stay the primary contract; this only widens what we accept as INPUT, since
+# assemble_trace re-emits canonical <thought> tags either way, so the exported
+# trace shape is identical for both axes.
+_LABEL_THOUGHTS_RE = re.compile(r"THOUGHTS:\s*(.*?)(?=^\s*FINAL_ANSWER:|\Z)", re.S | re.I | re.M)
+# FINAL_ANSWER body stops at a following labelled section: teachers append scratch
+# (a trailing "REASONING:" block) after the answer, and that must never become part
+# of the student's final turn.
+_LABEL_FINAL_RE = re.compile(r"FINAL_ANSWER:\s*(.*?)(?=^\s*(?:REASONING|THOUGHTS):|\Z)", re.S | re.I | re.M)
+_LABEL_BULLET_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s*")
+_LABEL_MIN_CHARS = 15
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
 OPAQUE_ID_RE = re.compile(r"\b(?:evt|doc)\.[A-Za-z0-9]+\b")
@@ -80,6 +104,7 @@ def build_prose_prompt(traj: dict) -> str:
         "plain-text answer grounded in the tool results",
         "",
         f"You must output {n} <thought>...</thought> blocks. No <tool_call> blocks.",
+        LITERAL_TAG_REMINDER,
         "No extra user turns. Do not write a line like",
         f"'{NUDGE_TEXT}'",
     ]
@@ -97,10 +122,14 @@ def parse_thoughts(content: str, n_steps: int) -> list[str] | None:
 
 
 def parse_final(content: str) -> str | None:
-    """Extract FINAL_ANSWER body, stripping leftover tags. None if missing/empty."""
+    """Extract FINAL_ANSWER body, stripping leftover tags. None if missing/empty.
+
+    Stops at a following labelled section (REASONING:/THOUGHTS:) so teacher scratch
+    written after the answer cannot leak into the student's final turn.
+    """
     if not content:
         return None
-    m = re.search(r"FINAL_ANSWER:\s*(.*)$", content, re.S | re.I)
+    m = _LABEL_FINAL_RE.search(content)
     if not m:
         return None
     final = m.group(1).strip()
@@ -111,16 +140,54 @@ def parse_final(content: str) -> str | None:
     return final
 
 
-def parse_teacher_output(content: str, n_steps: int) -> dict | None:
-    """Parse teacher reply. Returns {"thoughts": [...n_steps], "final": str} or None.
+def parse_labelled_thoughts(content: str, n_steps: int) -> list[str] | None:
+    """Fallback for label-shaped replies: a THOUGHTS: section with no tags.
 
-    Wrapper around parse_thoughts + parse_final. Single-teacher path stays one blob.
+    Strict on purpose - needs at least n_steps thought units of real length, so a
+    terse or malformed reply is still rejected rather than guessed at.
+    """
+    if not content or n_steps < 1:
+        return None
+    m = _LABEL_THOUGHTS_RE.search(content)
+    if not m:
+        return None
+    units = [_LABEL_BULLET_RE.sub("", line).strip() for line in m.group(1).splitlines()]
+    units = [u for u in units if len(u) >= _LABEL_MIN_CHARS]
+    if len(units) < n_steps:
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", " ".join(units))
+            if len(s.strip()) >= _LABEL_MIN_CHARS
+        ]
+        units = sentences
+    if len(units) < n_steps:
+        return None
+    return units[:n_steps]
+
+
+def parse_labelled_final(content: str) -> str | None:
+    """FINAL_ANSWER from a label-shaped reply. Section-bounded, so a trailing
+    REASONING:/THOUGHTS: block cannot leak into the trace (see parse_final)."""
+    return parse_final(content)
+
+
+def parse_teacher_output(content: str, n_steps: int) -> dict | None:
+    """Parse a teacher reply -> {"thoughts", "final", "format"} or None.
+
+    Tag shape first (canonical contract). If the teacher emitted bare labelled prose
+    instead, the label parser recovers it: same content, no tags. assemble_trace
+    re-emits canonical <thought> tags for both axes, so the exported trace is
+    identical - "format" only records which axis produced it, for eval.
     """
     thoughts = parse_thoughts(content, n_steps)
     final = parse_final(content)
-    if not thoughts or not final:
-        return None
-    return {"thoughts": thoughts, "final": final}
+    if thoughts and final:
+        return {"thoughts": thoughts, "final": final, "format": "tags"}
+    labelled_thoughts = parse_labelled_thoughts(content, n_steps)
+    labelled_final = final or parse_labelled_final(content)
+    if labelled_thoughts and labelled_final:
+        return {"thoughts": labelled_thoughts, "final": labelled_final, "format": "labels"}
+    return None
 
 
 def build_answer_prompt(traj: dict, thoughts: list[str]) -> str:
@@ -369,6 +436,9 @@ def assemble_trace(traj: dict, teacher_meta: dict, parsed: dict,
         "vars": traj.get("vars") or {},
         "distill_version": DISTILL_VERSION,
         "forge_spec": "0.2",
+        # Which input axis the teacher used ("tags" canonical, "labels" recovered by
+        # the fallback). Recorded so eval can compare quality across axes.
+        "prose_format": parsed.get("format") or "tags",
         "messages": msgs,
         "chain_steps": [
             {"tool": s["tool"], "args": s["args"], "result": s["result"],
