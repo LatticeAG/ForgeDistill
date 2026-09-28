@@ -51,6 +51,7 @@ def test_py_modules_exclude_dedup_and_harvest():
     py_modules = data["tool"]["setuptools"]["py-modules"]
     assert "dedup_filter" not in py_modules
     assert "harvest_prompts" not in py_modules
+    assert "external_chains" not in py_modules
 
 
 def test_no_transformers_in_install_metadata():
